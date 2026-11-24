@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.akios.serial</string>
+	<!-- AkIOS (11-22): a command line on the USB serial console (src/serial_console.c), the host's /dev/ttyACM0, through
+	     /dev/hakios-serial (a kernel with usbmux=1: the CDC-ACM function of configurations 3/4). Waits for the node;
+	     root, as the node is root's. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/akita/bin/serial_console</string>
+	</array>
+	<key>UserName</key>
+	<string>root</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

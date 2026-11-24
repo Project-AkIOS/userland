@@ -1,0 +1,96 @@
+# AkIOS's boot plan: what akinit (process 1, the image's /sbin/launchd) does, one step a line (akinit/plan.h has
+# the format, akinit/akinit.h the steps). `ak userland` writes it to the image's /etc/akios/boot.plan from this file
+# and userland.toml ([boot]), which fills in the words between at signs.
+#
+# The kernel's interfaces it relies on (renamed together with the kernel, later): boot-args root_apfs=, var_hfs=,
+# cryptex_dev= (akios.toml [kernel] default_args), the devices /dev/ufs_ios_*, the sysctls kern.hakios_switch_root,
+# kern.apfs_synthetic and kern.exec_inject.
+say AkIOS userland @IMAGE_ID@
+sysinfo
+
+# The iPhone's system volume from the flash as the root, read only, with our parts put over it without writing to it:
+# Apple's launchd jobs with ours added (the image's /akita/LaunchDaemons and xpc), the angels when one was edited,
+# only our audio device and Bluetooth's among the audio server's plug-ins, the firmware on /fw, and the applications
+# the first boot installs among the system's own. Then it becomes the root: this image goes to its /private/preboot,
+# the cryptexes are mounted where the volume's /System/Cryptexes point, and /akita is bound back.
+section flash-root if bootarg:root_apfs
+must mount apfs /dev/$root_apfs /flash ro
+synthetic /flash/akita
+bind /akita/LaunchDaemons /flash/System/Library/LaunchDaemons
+bind /akita/xpc /flash/System/Library/xpc
+if exists:/akita/LaunchAngels bind /akita/LaunchAngels /flash/System/Library/LaunchAngels
+bind /akita/hal /flash/System/Library/Audio/Plug-Ins/HAL
+if exists:/fw synthetic /flash/fw
+if exists:/fw bind /fw /flash/fw
+aliases /flash/private/var/staged_system_apps /flash/Applications .app
+must switchroot /flash private/preboot
+flag root-switched
+# the iPhone's layout: the cryptexes on their own partition (the OS one its first container, the App one its second);
+# else after the system volume on its device
+if bootarg:cryptex_dev mount apfs /dev/$cryptex_dev,c=0 /private/preboot/Cryptexes/OS ro
+if bootarg:cryptex_dev mount apfs /dev/$cryptex_dev,c=1 /private/preboot/Cryptexes/App ro
+if !bootarg:cryptex_dev mount apfs /dev/$root_apfs,c=1 /private/preboot/Cryptexes/OS ro
+if !bootarg:cryptex_dev mount apfs /dev/$root_apfs,c=2 /private/preboot/Cryptexes/App ro
+bind /private/preboot/akita /akita
+end
+
+# The data volume (HFS Plus, kept between boots) on /private/var: first the system's /private/var template and its
+# staged applications onto it (while the system's own is still in sight: the working directory stays in it), then
+# the iPhone's other volumes where iOS mounts them, when the phone has them.
+section data if flag:root-switched if bootarg:var_hfs
+chdir /private/var/staged_system_apps staged-reachable
+if !bootarg:var_template=0 seedvar /dev/$var_hfs /private/xarts
+must hfs /dev/$var_hfs /private/var
+flag var-kept
+flag var-mounted
+empty /private/var/tmp
+empty /private/var/run
+empty /private/var/vm
+@IOS_VOLUMES@
+gestalt /private/var/db/hakios.gestalt /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist
+if exists:/fw/aoc.bin keepcopy /fw/aoc.bin /private/var/hakios/fw/aoc.bin
+end
+
+section memory-var if !flag:var-kept
+must mount ramfs - /private/var rw
+flag var-mounted
+end
+
+section var
+if flag:var-mounted skel /akita/etc/var.skel /akita
+stagedapps /private/var/staged_system_apps /private/var/db/hakios-staged-apps
+# ls_rebuild=1: LaunchServices' database made again, with installd's record of the last build (one start is enough)
+if bootarg:ls_rebuild rm /private/var/installd/Library/MobileInstallation/LastBuildInfo.plist /private/var/installd/Library/MobileInstallation/MigrationInfo.plist /private/var/installd/Library/MobileInstallation/BackedUpState/SystemAppInstallState.plist /private/var/installd/Library/MobileInstallation/BackedUpState/BackupSystemAppInstallState.plist /private/var/mobile/Library/Preferences/com.apple.migration.plist
+if bootarg:ls_rebuild rm /private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/com.apple.LaunchServices*
+if bootarg:ls_rebuild sync
+# log_all=1: every program logs to its own file there (libakios.log, below), emptied of the last boot's; AFC's
+if bootarg:log_all mkdir /private/var/mobile/Media 0755
+if bootarg:log_all mkdir /private/var/mobile/Media/hakios-log 01777
+if bootarg:log_all empty /private/var/mobile/Media/hakios-log
+if bootarg:log_all chmod /private/var/mobile/Media/hakios-log 01777
+# the console kept on the data volume, five boots of it (boot_log=0: not)
+if !bootarg:boot_log=0 bootlog /private/var/mobile/Media/hakios-boot /dev/hakios-console 5
+# iOS's usermanagerd boot task (the personas), which launchd skips on a RAM-disk boot (persona_task=0: not)
+if flag:var-kept if !bootarg:persona_task=0 if exists:/usr/libexec/usermanagerd run timeout=@PERSONA_TIMEOUT@ out=/private/var/tmp/usermanagerd-init.txt /usr/libexec/usermanagerd --init
+if flag:var-kept if !bootarg:persona_task=0 if exists:/private/var/tmp/usermanagerd-init.txt grep /private/var/tmp/usermanagerd-init.txt PersonaID ersona+rror
+# logd takes a log directory without these markers for one of an older system, to be converted
+if flag:skel-done touch /private/var/db/diagnostics/.migrated 0644 272 272
+if flag:skel-done touch /private/var/db/diagnostics/timesync/.migrated 0644 272 272
+if flag:skel-done touch /private/var/db/uuidtext/.migrated 0644 272 272
+end
+
+section launchd
+# daemons that do not run as root get the console as their standard error too
+chmod /dev/console 0666
+inject /akita/etc/inject.conf
+if bootarg:log_all inject-line @LOG_ALL_LINE@
+inject-apply
+vnodes @MAX_VNODES@
+@LAUNCHD_STDERR@
+env PATH=/bin:/sbin:/usr/bin:/usr/sbin
+env HOME=/var/mobile
+env TERM=dumb
+if flag:root-switched exec /sbin/launchd
+end
+say no system volume to start launchd from (root_apfs=)
+halt

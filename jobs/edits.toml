@@ -1,0 +1,27 @@
+# Apple's launchd jobs as the IPSW has them (System/Library/xpc/launchd.plist, LaunchDaemons/, LaunchAngels/), with
+# these edits only; `ak userland` applies them and adds ours (jobs/com.akios.*.plist) to launchd.plist. Apple's
+# signature beside launchd.plist goes: it is over Apple's list, and with it launchd went by Apple's.
+
+# jobs that cannot work on this hardware and take the system down when they fail. watchdogd: _PanicOnCrash on
+# consecutive crashes, started by our IOWatchdog; it crashed at once and its restarts reset the phone (the kernel feeds
+# the SoC's own watchdog).
+deny = ["com.apple.watchdogd"]
+
+# keys set in a job
+[[set]]
+# launchd reboots into recovery after a few consecutive crashes of SpringBoard; while it is known to crash, a high
+# count keeps the phone up (at most 256)
+label = "com.apple.SpringBoard"
+keys = { _RecoverOnCrash = { RecoverOnCrashCount = 200 } }
+
+# environment variables added to a job
+[[env]]
+# the window server composes every layer itself: our display driver puts one layer over another without blending,
+# and an application's own "detached" layer showed black or flickered
+label = "com.apple.backboardd"
+vars = { CA_DISABLE_DETACHED = "1" }
+
+# `ak userland --oslog LABEL,...`: those jobs' standard error and os_log on the console (a diagnostic)
+[oslog]
+stderr = "/dev/console"
+vars = { OS_ACTIVITY_DT_MODE = "YES", ACTIVITY_LOG_STDERR = "1", CFLOG_FORCE_STDERR = "1" }

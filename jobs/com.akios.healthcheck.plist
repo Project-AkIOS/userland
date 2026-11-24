@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.akios.healthcheck</string>
+	<!-- the device health report on the console 25 s into every start (src/tools/healthcheck.c): what the old image's
+	     job runner did with its quiet job list -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/akita/bin/healthcheck</string>
+		<string>-w</string>
+		<string>25</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>
