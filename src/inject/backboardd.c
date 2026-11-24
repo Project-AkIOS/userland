@@ -1,0 +1,2026 @@
+/*
+ * libakios.backboardd.dylib: code of ours inside stock Darwin programs.
+ *
+ * launchd starts the jobs named in INJECT (see build.sh / mkjobs.py) with
+ * DYLD_INSERT_LIBRARIES pointing here; dyld honours that because the kernel's AMFI stand-in
+ * says so. What is done depends on the program:
+ *
+ *   backboardd   the window server (CoreAnimation in QuartzCore). There is no GPU, so the
+ *                render server must use CoreAnimation's own software rasterizer, and we want to
+ *                see why a frame is or is not drawn. The C++ objects are reached by replacing
+ *                entries of their virtual tables.
+ *                It is also where input enters the system: backboardd is the HID event server,
+ *                and without Apple's multitouch driver it has no touch screen. We give it one:
+ *                a "virtual" HID service that turns the samples of /dev/hakios-touch into the
+ *                events that driver would have sent.
+ *
+ *                And it does not wait five seconds for an ambient light sensor.
+ *
+ *   containermanagerd (both of them)
+ *                They ask the user manager for the "personas" of the user, of which this
+ *                system has none, twenty times a second apart before they give up -- and
+ *                everything that needs a container (the window server, for one) waits with
+ *                them. Told that personas are not supported, they do not ask.
+ *
+ * Addresses of things inside the dyld shared cache are those of Darwin userland 16.5 (20F66) for iPhone10,3;
+ * every one is checked against what is expected to be there before it is touched.
+ */
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#include <dispatch/dispatch.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <notify.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/sysctl.h>
+#include <signal.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
+
+#include "akios_gl.h"
+#include "akios_input.h"
+
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+
+#define CACHE_BASE 0x180000000UL                /* where the cache was built to be, before the slide */
+/* an address of the shared cache as each build this is made for has it: Darwin userland 16.5 (20F66), 16.7.16 (20H392:
+ * the same symbols, found by name in the cache's local symbols -- tools/dsc-symbols.py). ios_build.h is written by
+ * build.sh from sysimage/build.conf. */
+#include "ios_build.h"
+#if defined(HAKIOS_IOS_20G81)
+#define AT(f66, h392, g81) (g81)
+#elif defined(HAKIOS_IOS_20H392)
+#define AT(f66, h392, g81) (h392)
+#else
+#define AT(f66, h392, g81) (f66)
+#endif
+#define HAKIOS_GL "/akita/lib/libhakios.gl.dylib"
+
+static uintptr_t slide;
+
+static void
+say(const char *format, ...)
+{
+	char line[256];
+	va_list ap;
+	int n;
+
+	va_start(ap, format);
+	n = vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	if (n > (int)sizeof(line) - 1) {
+		n = sizeof(line) - 1;
+	}
+	write(2, line, (size_t)n);
+}
+
+/* Replace one entry of a virtual table (unslid address `slot`) that must now hold `expected`. */
+static void *
+replace_virtual(const char *what, uintptr_t slot, uintptr_t expected, void *replacement)
+{
+	uintptr_t *entry = (uintptr_t *)(slot + slide);
+	vm_address_t page = (vm_address_t)entry & ~(vm_address_t)(vm_page_size - 1);
+	kern_return_t kr;
+	void *original;
+
+	if (*entry != expected + slide) {
+		say("hakios: %s: found %#lx, expected %#lx; left alone\n", what, *entry - slide, expected);
+		return NULL;
+	}
+	/* the tables are in read-only memory shared by every process: get a private writable copy of the page */
+	kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	if (kr != KERN_SUCCESS) {
+		say("hakios: %s: cannot make the table writable (%d)\n", what, kr);
+		return NULL;
+	}
+	original = (void *)*entry;
+	*entry = (uintptr_t)replacement;
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
+	return original;
+}
+
+/* ---- backboardd: CA::WindowServer ------------------------------------------------------------ */
+
+#define VT_APPLE_CLCD_DISPLAY   AT(0x1d5b44520UL, 0x1d5b38788UL, 0x1e04f7478UL)   /* vtable for CA::WindowServer::AppleCLCDDisplay */
+#define VT_EAGL_SERVER          AT(0x1d5b45c58UL, 0x1d5b39ed0UL, 0x1e04f7d60UL)   /* vtable for CA::WindowServer::EAGLServer */
+#define VSLOT(vtable, offset)   ((vtable) + 0x10 + (offset))
+/* (20H392: AppleCLCDDisplay has one more virtual function before begin_update -- begin_update and finish_update
+ * are one slot further, 0x178 and 0x180; the first boot said so: the old slots held the neighbours)
+ * 20G81 (arm64e): 0x178 and 0x180 as well, read from the vtable in the cache; its entries are PAC-signed there. */
+
+#define DISPLAY_FLAGS(display)  (*(uint64_t *)((char *)(display) + 0x9f2))
+#define DISPLAY_B233(display)   (*(uint8_t *)((char *)(display) + 0x233))
+
+static int (*orig_is_ready)(void *display);
+static int (*orig_ignore_update_p)(void *display, void *update);
+static uintptr_t (*orig_begin_update)(void *display, void *update);
+static uintptr_t (*orig_finish_update)(void *display, void *update, unsigned flags);
+static void *(*orig_renderer)(void *server);
+static uintptr_t (*orig_render_update)(void *server, void *update, unsigned *flags);
+
+static unsigned calls_ready, calls_ignore, calls_begin, calls_finish, calls_render;
+static int last_ready = -1, last_ignore = -1;
+
+static int
+my_is_ready(void *display)
+{
+	int ready = orig_is_ready(display);
+
+	if (ready != last_ready || calls_ready < 3) {
+		say("hakios: is_ready -> %d (call %u, flags %#llx, b233 %#x)\n", ready, calls_ready,
+		    (unsigned long long)DISPLAY_FLAGS(display), DISPLAY_B233(display));
+		last_ready = ready;
+	}
+	calls_ready++;
+	return ready;
+}
+
+static int
+my_ignore_update_p(void *display, void *update)
+{
+	int ignore = orig_ignore_update_p(display, update) & 1;
+
+	if (ignore != last_ignore || calls_ignore < 3) {
+		uint64_t *q = (uint64_t *)((char *)display + 0x220);
+
+		say("hakios: ignore_update_p -> %d (call %u, flags %#llx, update flags %#x)\n", ignore, calls_ignore,
+		    (unsigned long long)DISPLAY_FLAGS(display), *(uint32_t *)((char *)update + 0xf0));
+		say("hakios:   display +0x220: %#llx %#llx %#llx %#llx %#llx %#llx\n", (unsigned long long)q[0],
+		    (unsigned long long)q[1], (unsigned long long)q[2], (unsigned long long)q[3], (unsigned long long)q[4],
+		    (unsigned long long)q[5]);
+		last_ignore = ignore;
+	}
+	calls_ignore++;
+	return ignore;
+}
+
+static uintptr_t
+my_begin_update(void *display, void *update)
+{
+	uintptr_t r = orig_begin_update(display, update);
+
+	if (calls_begin++ < 6) {
+		say("hakios: begin_update -> %#lx (flags %#llx)\n", r, (unsigned long long)DISPLAY_FLAGS(display));
+	}
+	return r;
+}
+
+/*
+ * After each display update: the kernel told the frame is recorded, every stage of it (kern.hakios.ws_frame): the
+ * display then shows its surface as soon as the GPU is done with it, without the grace it waits for a later stage
+ * otherwise (2.5 ms: frames whose GPU work ended past ~5.6 ms into a refresh missed it).
+ */
+static void
+tell_frame_recorded(void)
+{
+	static int mib[4];
+	static size_t mib_length;
+	static int state;       /* 0 not looked up, 1 there, -1 not */
+	int one = 1;
+
+	if (state == 0) {
+		mib_length = 4;
+		state = sysctlnametomib("kern.hakios.ws_frame", mib, &mib_length) == 0 ? 1 : -1;
+	}
+	if (state == 1) {
+		sysctl(mib, (u_int)mib_length, NULL, NULL, &one, sizeof(one));
+	}
+}
+
+static uintptr_t
+my_finish_update(void *display, void *update, unsigned flags)
+{
+	uintptr_t r = orig_finish_update(display, update, flags);
+
+	tell_frame_recorded();
+
+	if (calls_finish++ < 6) {
+		say("hakios: finish_update(%#x) -> %#lx\n", flags, r);
+	}
+	return r;
+}
+
+/*
+ * Every frame the server asks for its renderer, and while there is none it tries again to make a
+ * Metal and then an OpenGL ES context, which costs a lot and cannot succeed here. One try is enough:
+ * without a renderer the server draws with CA::WindowServer::Server::sw_renderer().
+ */
+static void *
+my_renderer(void *server)
+{
+	static int failed, said;
+	void *renderer;
+
+	if (failed) {
+		return NULL;
+	}
+	renderer = orig_renderer(server);
+	if (renderer == NULL) {
+		failed = 1;
+		say("hakios: no accelerated renderer; the software one will draw\n");
+	} else if (!said) {
+		said = 1;
+		say("hakios: the server has an accelerated renderer (%p)\n", renderer);
+	}
+	return renderer;
+}
+
+static uintptr_t
+my_render_update(void *server, void *update, unsigned *flags)
+{
+	uintptr_t r = orig_render_update(server, update, flags);
+
+	if (calls_render++ < 6) {
+		say("hakios: render_update -> %#lx (flags %#x)\n", r, flags ? *flags : 0);
+	}
+	return r;
+}
+
+/*
+ * CoreAnimation draws a layer's pixels with one of ninety "functions" (a fragment shader each: an
+ * image as it is, an image through a colour matrix, a blur of so many samples, ...), and asks
+ * its renderer which of them it has. Its OpenGL ES renderer has not half of them (the Metal one
+ * has all). Which ones are asked for and missing is worth knowing: said once each.
+ * (The last of the ninety, "cst", is not asked about: the OpenGL ES renderer draws it with no
+ * program at all. The lock screen's wallpaper goes that way; see plain_draw_begin() in eagl.c.)
+ */
+#define VT_GLES_CONTEXT         AT(0x1d5b3b540UL, 0x1d5b2f6e8UL, 0x1e04ee1d8UL)   /* vtable for CA::OGL::GLESContext */
+
+static int gl_loaded;                           /* CoreAnimation draws with OpenGL ES (opengl_es() below) */
+static void (*gl_function_refused)(unsigned function);  /* our OpenGL ES library keeps count (eagl.c, the census) */
+static int (*orig_function_supported)(void *context);
+
+/*
+ * Boot-arg glyes=N[,N...]: the renderer is made to answer that it has those functions after all.
+ * It has no shader for them, so CoreAnimation draws them with no program -- which is the way the
+ * functions it never asks about are drawn, and which our OpenGL ES library stands in for
+ * (eagl.c, plain_draw_begin()); without this, what needs such a function is not drawn at all.
+ * For finding out what a missing function is for: with it the draw is made, its numbers arrive
+ * (function_uniform below), and the picture says whether the thing was that function's.
+ */
+/*
+ * Saying yes to a function the renderer has no shader for is not enough and not safe. Told yes for
+ * "sb3" (40) -- the four samples of a shadow's blur, which our OpenGL ES library has a stand-in for
+ * (eagl.c, blur4_fragment) -- CoreAnimation takes the way of one it has a shader for, finds none,
+ * and the window server dies; it came back every half a minute, with SpringBoard after it, and the
+ * stand-in was never reached: a function it asks about and is told yes to is not one it draws with
+ * no program. What is needed is to hand it a program where it looks for one, which is another
+ * entry of the same table. Until then it is told the truth, and what needs that function is not
+ * drawn -- the shadow under a card of the switcher of running applications.
+ */
+/*
+ * Where the window server died. Its crash reports never arrive here -- the kernel says "Failed to
+ * send exception EXC_CORPSE_NOTIFY" and that is the end of it -- so a SIGSEGV in CoreAnimation has
+ * been a silent restart every half a minute with nothing to go on. This turns one into a line: the
+ * address it touched and where it was, both as they would be in the shared cache as built, which
+ * "ipsw dyld a2s" turns into a name. Then the signal is let through to kill the process as before.
+ */
+/* " ADDR" in the shared cache as built (unslid: ipsw dyld a2s), or " IMAGE+OFFSET" for an image outside it (the
+ * Metal plug-in, a program's own code): a frame of the crash line */
+static size_t
+say_frame(char *out, size_t size, uintptr_t address)
+{
+	size_t length = 0;
+	uintptr_t cache = (uintptr_t)_dyld_get_shared_cache_range(&length);
+	Dl_info info;
+
+	if (address >= cache && address < cache + length) {
+		return (size_t)snprintf(out, size, " %#lx", address - slide);
+	}
+	if (dladdr((void *)address, &info) != 0 && info.dli_fname != NULL) {
+		const char *image = strrchr(info.dli_fname, '/');
+		return (size_t)snprintf(out, size, " %s+%#lx", image != NULL ? image + 1 : info.dli_fname,
+		    address - (uintptr_t)info.dli_fbase);
+	}
+	return (size_t)snprintf(out, size, " ?%#lx", address);
+}
+
+static void
+say_the_fault(int signal_number, siginfo_t *info, void *context_in)
+{
+	ucontext_t *context = context_in;
+	uintptr_t pc = 0, lr = 0;
+
+	if (context != NULL && context->uc_mcontext != NULL) {
+		pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(context->uc_mcontext->__ss);
+		lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(context->uc_mcontext->__ss);
+	}
+	/*
+	 * And who called, by walking the frame pointers: on arm64 each frame holds the previous one
+	 * at [fp] and its return address at [fp + 8]. The crash itself is usually in a library
+	 * function -- strdup of a null name, say -- and the frame that matters is two or three up.
+	 */
+	char frames[16 * 48 + 1] = "";
+	size_t used = 0;
+	uintptr_t fp = context != NULL && context->uc_mcontext != NULL ? (uintptr_t)__darwin_arm_thread_state64_get_fp(context->uc_mcontext->__ss) : 0;
+
+	for (unsigned i = 0; i < 16 && fp != 0 && (fp & 7) == 0; i++) {
+		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+
+		if (ret == 0) {
+			break;
+		}
+		used += say_frame(frames + used, sizeof(frames) - used, ret);
+		fp = next > fp ? next : 0;      /* the chain only ever goes up the stack */
+	}
+	char pcs[2][64] = { "", "" };
+	say_frame(pcs[0], sizeof(pcs[0]), pc);
+	say_frame(pcs[1], sizeof(pcs[1]), lr);
+	say("hakios: signal %d at %p, pc%s, lr%s, called from%s (in the shared cache unslid, else IMAGE+offset)\n",
+	    signal_number, info != NULL ? info->si_addr : NULL, pcs[0], pcs[1], frames);
+	signal(signal_number, SIG_DFL);
+	raise(signal_number);
+}
+
+static void
+watch_for_faults(void)
+{
+	struct sigaction action;
+
+	memset(&action, 0, sizeof(action));
+	action.sa_sigaction = say_the_fault;
+	action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	sigaction(SIGSEGV, &action, NULL);
+	sigaction(SIGBUS, &action, NULL);
+	/* An Objective-C exception that nobody catches ends in abort(), not in a fault, and a program
+	   that dies that way says nothing at all here -- a run that restarted a daemon 31 times was
+	   silent until these three were watched as well. */
+	sigaction(SIGABRT, &action, NULL);
+	sigaction(SIGILL, &action, NULL);
+	sigaction(SIGTRAP, &action, NULL);
+}
+
+/*
+ * CoreAnimation's OpenGL ES renderer keeps the source of one fragment shader per function in a
+ * table of its own -- unslid 0x1d5b54790, indexed by the function's number -- and the functions it
+ * has no shader for are null entries there. That is the whole of "the renderer has no function
+ * 40": GLContext::create_shader takes the source from that table, and function_supported answers
+ * from the same place. Made to answer yes without the entry, create_shader hands the null to
+ * strdup and the window server dies in strlen, which is what glyes=40 did for a whole afternoon.
+ *
+ * So the way to give the renderer a function is to give it a source. "sb3" (40) is the single
+ * pass of a blur -- GaussianBlurFilter::render -> Context::blur_surface ->
+ * BlurState::single_pass_blur -- the one that lays the shadow under a card of the switcher of
+ * running applications. It is given the same four places as "ds4" (26) and has no weights of its
+ * own, so this is ds4's own shader with the weights taken out, in the dialect the others are
+ * written in (sampler2DRect, varying, gl_FragData -- the preamble is added by the renderer).
+ *
+ * Where this stands. With the entry filled the window server no longer dies: thirty-odd crashes a
+ * run become none, with glyes=40 as well, and the function really is drawn -- the renderer rewrites
+ * our source into its own dialect (sampler2DRect becomes sampler2D) and compiles it, and the
+ * picture changes by a level or two across the whole screen where before it did not change at all.
+ *
+ * What it does not do is bring back a shadow, and the reason is that none was missing. This
+ * function was taken up because a note here said the shadow under a card of the switcher was not
+ * drawn; that note was reasoning from "the function is refused", not an observation. Against the
+ * same frame drawn by CoreAnimation's software renderer -- which draws everything correctly, only
+ * slowly -- the edge of a card is the same to the level: 18, 17, 17, then the card. There is no
+ * soft falloff there in either, so there is nothing of that kind to restore.
+ *
+ * Its effect is nil for a second reason worth writing down: the four places reach the shader as
+ * varyings that a vertex shader computes from "uniform highp vec2 offset[4]", and the two groups
+ * of four numbers function_uniform delivers for it are of the order of 5e-19 -- zero, for a
+ * blur. CoreAnimation asks for the single-pass blur exactly when the radius is too small to need
+ * the multi-pass one, so the four samples coincide and the pass copies what it was given.
+ */
+#define CA_SHADER_TABLE         AT(0x1d5b54790UL, 0x1d5b48a10UL, 0x1d5b5e130UL)
+
+static const char shadow_blur_source[] =
+    "uniform lowp sampler2DRect texture0;\n"
+    "varying highp vec2 texcoord0, texcoord1, texcoord2, texcoord3;\n"
+    "void main () {\n"
+    "  lowp vec4 q0, q1, q2, q3;\n"
+    "  q0 = texture2DRect(texture0, texcoord0);\n"
+    "  q1 = texture2DRect(texture0, texcoord1);\n"
+    "  q2 = texture2DRect(texture0, texcoord2);\n"
+    "  q3 = texture2DRect(texture0, texcoord3);\n"
+    "  gl_FragData[0] = (q0 + q1 + q2 + q3) * 0.25;\n"
+    "}\n";
+
+static void
+give_the_renderer_a_shader(unsigned function, const char *source)
+{
+	uintptr_t *entry = (uintptr_t *)(CA_SHADER_TABLE + slide + 8 * (uintptr_t)function);
+	vm_address_t page = (vm_address_t)entry & ~(vm_address_t)(vm_page_size - 1);
+
+	if (*entry != 0) {
+		say("hakios: CoreAnimation's function %u has a shader of its own; left alone\n", function);
+		return;
+	}
+	/* the table is read-only memory shared by every process: a private writable copy of the page */
+	if (vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+		say("hakios: CoreAnimation's function %u: cannot make the table of shaders writable\n", function);
+		return;
+	}
+	*entry = (uintptr_t)source;
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
+	say("hakios: CoreAnimation's function %u (\"sb3\") is given a shader of ours\n", function);
+}
+
+static uint8_t say_yes[90];
+static int compile_shaders_said;                /* boot-arg glcompile=1: write down every shader source */
+
+static void
+functions_said_yes(const char *arguments)
+{
+	static const char names[] = HAKIOS_CA_FUNCTIONS;
+	const char *argument = strstr(arguments, "glno=");
+
+	/* glno=N[,N...]: and the other way about, for seeing what a function of ours stands in for */
+	for (argument = argument != NULL ? argument + 5 : NULL; argument != NULL && *argument >= '0' && *argument <= '9';) {
+		unsigned function = (unsigned)strtoul(argument, (char **)&argument, 10);
+
+		if (function < 90) {
+			say_yes[function] = 0;
+			say("hakios: the renderer will not answer that it has CoreAnimation's function %u (\"%.3s\")\n",
+			    function, names + 4 * function);
+		}
+		argument = *argument == ',' ? argument + 1 : NULL;
+	}
+	argument = strstr(arguments, "glyes=");
+	for (argument = argument != NULL ? argument + 6 : NULL; argument != NULL && *argument >= '0' && *argument <= '9';) {
+		unsigned function = (unsigned)strtoul(argument, (char **)&argument, 10);
+
+		if (function < 90) {
+			say_yes[function] = 1;
+			say("hakios: the renderer will answer that it has CoreAnimation's function %u (\"%.3s\")\n",
+			    function, names + 4 * function);
+		}
+		argument = *argument == ',' ? argument + 1 : NULL;
+	}
+}
+
+/*
+ * CA::OGL::Context::compile_shader(const char *) -- slot 0x060 of the same table. The OpenGL ES
+ * renderer does not carry its shaders ready-made: it assembles the text of each from a preamble
+ * (GLESContext::shader_preamble, slot 0x400) and pieces chosen by what the draw needs, and
+ * compiles it here. That makes this the place where it looks for a program, and therefore the
+ * place where one can be handed to it for a function it has no pieces for ("sb3", 40: the four
+ * samples of a shadow's blur, missing under the cards of the switcher). This writes down what it
+ * is asked to compile, so that a run with glyes=40 says whether a source is assembled at all
+ * before the window server dies, and what it looks like if so.
+ */
+static uintptr_t (*orig_compile_shader)(void *context, const char *source);
+
+static uintptr_t
+my_compile_shader(void *context, const char *source)
+{
+	static unsigned told, seen;
+
+	/* that it is called at all is worth one line, because a renderer that compiles nothing here
+	   would mean the text is assembled and compiled somewhere this table does not reach */
+	if (seen++ == 0) {
+		say("hakios: CoreAnimation compiles its shaders through the table (the first of them, %zu characters)\n",
+		    source != NULL ? strlen(source) : 0);
+	}
+	if (compile_shaders_said && told < 24) {
+		told++;
+		say("hakios: CoreAnimation compiles a shader, %zu characters:\n", source != NULL ? strlen(source) : 0);
+		for (size_t at = 0, length = source != NULL ? strlen(source) : 0; at < length; at += 700) {
+			say("hakios:  %.700s\n", source + at);
+		}
+	}
+	return orig_compile_shader(context, source);
+}
+
+static int
+my_function_supported(void *context)
+{
+	static const char names[] = HAKIOS_CA_FUNCTIONS;
+	static uint8_t said[256];
+	int supported = orig_function_supported(context);
+	uint8_t function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
+
+	if (!supported && function < 90 && say_yes[function] && gl_loaded) {
+		if (!said[function]) {
+			said[function] = 1;
+			say("hakios: CoreAnimation's function %u (\"%.3s\"): the renderer is made to say it has it\n",
+			    function, names + 4 * function);
+		}
+		return 1;
+	}
+	if (!supported && gl_function_refused != NULL) {
+		gl_function_refused(function);
+	}
+	if (!supported && !said[function]) {
+		said[function] = 1;
+		say("hakios: CoreAnimation's OpenGL ES renderer has no function %u (\"%.3s\"): what needs it is not drawn\n",
+		    function, function < 90 ? names + 4 * function : "?");
+	}
+	return supported;
+}
+
+/*
+ * A function that takes numbers besides its textures (a colour matrix, say) is given them through
+ * GLContext::function_uniform(), which hands them to the function's shader. The functions the
+ * OpenGL ES renderer has no shader for are drawn all the same, with no program, and their numbers
+ * go nowhere. Our OpenGL ES library draws some of those with programs of its own (eagl.c,
+ * plain_draw_begin()): it is told the numbers here, and with them the context, in which it
+ * finds which function a draw is.
+ */
+static void (*orig_function_uniform)(void *context, unsigned index, size_t components, size_t count, const float *values);
+static void (*gl_function_values)(void *context, unsigned function, unsigned index, size_t components, size_t count,
+    const float *values);
+
+static void
+my_function_uniform(void *context, unsigned index, size_t components, size_t count, const float *values)
+{
+	uint8_t function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
+
+	/*
+	 * Who is calling. Told yes for a function it has no shader for (glyes=40), CoreAnimation gets
+	 * this far -- it hands the function its numbers -- and then dies in whatever comes next, which
+	 * is where it takes the program for the function out of a table of its own. These addresses,
+	 * unslid, name that caller for "ipsw dyld a2s", and it is the only thread to pull: nothing is
+	 * ever compiled for the function (no shader arrives at our library), and the compiler is not
+	 * reached through the renderer's table either.
+	 */
+	if (say_yes[function < 90 ? function : 0]) {
+		static uint8_t told[90];
+
+		if (function < 90 && !told[function]) {
+			told[function] = 1;
+			say("hakios: function %u takes its numbers from %#lx %#lx %#lx\n", function,
+			    (uintptr_t)__builtin_return_address(0) - slide,
+			    (uintptr_t)__builtin_return_address(1) - slide,
+			    (uintptr_t)__builtin_return_address(2) - slide);
+		}
+	}
+	if (gl_function_values != NULL) {
+		gl_function_values(context, function, index, components, count, values);
+	}
+	orig_function_uniform(context, index, components, count, values);
+}
+
+/*
+ * Boot-arg touch_lat=1: a line for every client commit the window server applies (CA::Render::Context::did_commit, entered
+ * through a jump written over its first four instructions, kept in a trampoline as inject_log.c does for _os_log_impl):
+ *   tl: r CONTEXT FLAG1 TIME FLAG2 at US
+ * CONTEXT the server's context object (one per client layer tree), TIME its double argument (a commit time, CA's seconds?),
+ * US mach_absolute_time in microseconds. For frame pacing: when the application's frame reached the server, against
+ * the server's frame starts (tools/frames.py's "tl:" lines).
+ */
+#include <libkern/OSCacheControl.h>
+#include <sys/mman.h>
+
+#define CA_RENDER_CONTEXT_DID_COMMIT AT(0, 0, 0x1886f6238UL)   /* CA::Render::Context::did_commit(bool, double, bool) */
+typedef void (*did_commit_fn)(void *, bool, double, bool);
+static did_commit_fn did_commit_trampoline;
+static mach_timebase_info_data_t commit_timebase;
+
+static void
+did_commit_hooked(void *context, bool flag1, double time, bool flag2)
+{
+	uint64_t us = mach_absolute_time() * commit_timebase.numer / commit_timebase.denom / 1000;
+
+	did_commit_trampoline(context, flag1, time, flag2);
+	say("tl: r %lx %d %.6f %d at %llu\n", (unsigned long)((uintptr_t)context & 0xffffff), flag1, time, flag2,
+	    (unsigned long long)us);
+}
+
+/* AT (slid) entered through a jump to OURS; the first four instructions kept in a trampoline (returned, signed) */
+static void *
+inline_hook(const char *what, uintptr_t at, void *ours)
+{
+	uint32_t first[4], code[4], *trampoline;
+	uintptr_t back, target;
+	vm_address_t page;
+
+	memcpy(first, (void *)at, sizeof(first));
+	if (first[0] != 0xd503237f) {   /* pacibsp: the function as read from this cache */
+		say("hakios: %s begins %08x: not hooked\n", what, first[0]);
+		return NULL;
+	}
+	for (int i = 1; i < 4; i++) {   /* (nothing there may depend on where it runs) */
+		uint32_t w = first[i];
+
+		if ((w & 0x1f000000) == 0x10000000 || (w & 0x7c000000) == 0x14000000 || (w & 0xff000010) == 0x54000000 ||
+		    (w & 0x7e000000) == 0x34000000 || (w & 0x7e000000) == 0x36000000 || (w & 0x3b000000) == 0x18000000) {
+			say("hakios: %s: instruction %08x moves badly: not hooked\n", what, w);
+			return NULL;
+		}
+	}
+	trampoline = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+	if (trampoline == MAP_FAILED) {
+		return NULL;
+	}
+	memcpy(trampoline, first, sizeof(first));
+	trampoline[4] = 0x58000050;     /* ldr x16, #8 */
+	trampoline[5] = 0xd61f0200;     /* br x16 */
+	back = at + 16;
+	memcpy(&trampoline[6], &back, 8);
+	if (mprotect(trampoline, 0x4000, PROT_READ | PROT_EXEC) != 0) {
+		return NULL;
+	}
+	sys_icache_invalidate(trampoline, 32);
+	target = (uintptr_t)__builtin_ptrauth_strip(ours, 0);
+	code[0] = 0x58000050;
+	code[1] = 0xd61f0200;
+	memcpy(&code[2], &target, 8);
+	page = at & ~(vm_address_t)(vm_page_size - 1);
+	if (vm_protect(mach_task_self(), page, 2 * vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+		say("hakios: %s: the page stays read-only: not hooked\n", what);
+		return NULL;
+	}
+	memcpy((void *)at, code, sizeof(code));
+	vm_protect(mach_task_self(), page, 2 * vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate((void *)at, sizeof(code));
+	return __builtin_ptrauth_sign_unauthenticated((void *)trampoline, 0, 0);
+}
+
+/*
+ * ... and every refresh tick of the window server (CA::WindowServer::IOMFBServer::vsync_callback(fb, ?, TIMESTAMP,
+ * INTERVAL, server)), which draws by render_for_time(TIMESTAMP + INTERVAL) -- that decides whether there is anything to
+ * draw -- unless server +0x2b0 (CA seconds; usually 0) is later than that or TIMESTAMP before server +0x2d8:
+ *   tl: y TIMESTAMP_US INTERVAL_US +0x2b0_US +0x2d8_US at US
+ * (11-20: ticks on every refresh, ~60 us after the display driver's beat, INTERVAL its measured 8.36 ms.)
+ */
+#define IOMFB_SERVER_VSYNC_CALLBACK AT(0, 0, 0x1885875fcUL)
+typedef void (*vsync_callback_fn)(void *, uint64_t, uint64_t, uint64_t, void *);
+static vsync_callback_fn vsync_trampoline;
+
+static uint64_t
+host_us(uint64_t host)
+{
+	return host * commit_timebase.numer / commit_timebase.denom / 1000;
+}
+
+static void
+vsync_hooked(void *fb, uint64_t a, uint64_t timestamp, uint64_t interval, void *server)
+{
+	double next = *(volatile double *)((char *)server + 0x2b0);
+	uint64_t not_before = *(volatile uint64_t *)((char *)server + 0x2d8), t0 = mach_absolute_time();
+
+	vsync_trampoline(fb, a, timestamp, interval, server);
+	say("tl: y %llu %llu %lld %llu at %llu\n", (unsigned long long)host_us(timestamp), (unsigned long long)host_us(interval),
+	    isinf(next) ? -1LL : (long long)(next * 1e6), (unsigned long long)host_us(not_before), (unsigned long long)host_us(t0));
+}
+
+static void
+commit_lines(void)
+{
+	void *t;
+
+	mach_timebase_info(&commit_timebase);
+	if (CA_RENDER_CONTEXT_DID_COMMIT == 0) {
+		return;
+	}
+	if ((t = inline_hook("did_commit", CA_RENDER_CONTEXT_DID_COMMIT + slide, (void *)did_commit_hooked)) != NULL) {
+		did_commit_trampoline = (did_commit_fn)t;
+	}
+	if ((t = inline_hook("vsync_callback", IOMFB_SERVER_VSYNC_CALLBACK + slide, (void *)vsync_hooked)) != NULL) {
+		vsync_trampoline = (vsync_callback_fn)t;
+	}
+	say("hakios: touch_lat=1: the window server's commits said (tl: r)\n");
+	/* (frame pacing: QuartzCore's switches for frame-rate arbitration / reduced server vsync render, once settled) */
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
+		if (AT(0, 0, 1) != 0) {
+			say("hakios: QuartzCore: capability %d (once %ld), arbitration flag %d, reduced-render flag %d, use_vbl %d\n",
+			    *(volatile uint8_t *)(0x1dda90ca8UL + slide), (long)*(volatile intptr_t *)(0x1dda918b0UL + slide),
+			    *(volatile uint8_t *)(0x1dda922c2UL + slide), *(volatile uint8_t *)(0x1dda922c4UL + slide),
+			    *(volatile uint8_t *)(0x1dda910b8UL + slide));
+		}
+	});
+}
+
+static void
+window_server_fixes(void)
+{
+	/*
+	 * iOS 27 (11-21): none of this applies. The display class is CA::WindowServer::AppleInternalDisplay (IOMFBDisplay's;
+	 * is_ready/ignore_update_p/begin_update/finish_update at its vtable +0x108/+0x180/+0x1d0/+0x1d8), whose entries are
+	 * PAC-signed -- a plain pointer written there crashes at the first call -- and finish_update takes a fourth
+	 * argument; there is no OpenGL ES renderer (Metal only), and the QuartzCore globals below are 16.5's addresses.
+	 * To be redone for iOS 27 with signed entries (TODO); until then left alone.
+	 */
+	say("hakios: window server hooks: none on iOS 27 (16.x's vtables and addresses; to be redone with PAC-signed entries)\n");
+	return;
+	orig_is_ready = replace_virtual("is_ready", VSLOT(VT_APPLE_CLCD_DISPLAY, 0xb0), AT(0x1882f0908UL, 0x1882f9318UL, 0x1885ca168UL), my_is_ready);
+	orig_ignore_update_p = replace_virtual("ignore_update_p", VSLOT(VT_APPLE_CLCD_DISPLAY, 0x138), AT(0x1882e0c90UL, 0x1882e9684UL, 0x1885b921cUL),
+	    my_ignore_update_p);
+	orig_begin_update = replace_virtual("begin_update", VSLOT(VT_APPLE_CLCD_DISPLAY, AT(0x170, 0x178, 0x178)), AT(0x1882ddda4UL, 0x1882e6798UL, 0x1885b5ed8UL),
+	    my_begin_update);
+	orig_finish_update = replace_virtual("finish_update", VSLOT(VT_APPLE_CLCD_DISPLAY, AT(0x178, 0x180, 0x180)), AT(0x1882c8568UL, 0x1882d0f88UL, 0x18859f3c4UL),
+	    my_finish_update);
+	orig_renderer = replace_virtual("renderer", VSLOT(VT_EAGL_SERVER, 0x1a0), AT(0x1882e2548UL, 0x1882eaf3cUL, 0x1885baba0UL), my_renderer);
+	orig_render_update = replace_virtual("render_update", VSLOT(VT_EAGL_SERVER, 0x178), AT(0x18835770cUL, 0x1883601dcUL, 0x188636100UL),
+	    my_render_update);
+	if (gl_loaded) {
+		orig_function_supported = replace_virtual("function_supported", VSLOT(VT_GLES_CONTEXT, 0x378), AT(0x1884a9308UL, 0x1884b2164UL, 0x18879e9bcUL),
+		    my_function_supported);
+		if (gl_function_values != NULL) {
+			orig_function_uniform = replace_virtual("function_uniform", VSLOT(VT_GLES_CONTEXT, 0x388), AT(0x1884a9350UL, 0x1884b21acUL, 0x18879a880UL),
+			    my_function_uniform);
+		}
+		/* always, because the boot-args are read in another place than this and the order of the
+		   two is not ours to rely on; the hook writes nothing unless glcompile=1 */
+		orig_compile_shader = (uintptr_t (*)(void *, const char *))replace_virtual("compile_shader",
+		    VSLOT(VT_GLES_CONTEXT, 0x060), AT(0x1883fc808UL, 0x1884053fcUL, 0x1886eb388UL), my_compile_shader);
+		say("hakios: the shader compiler of CoreAnimation is %s\n", orig_compile_shader ? "watched" : "NOT watched");
+		watch_for_faults();
+		{
+			char arguments[1024] = "";
+			size_t size = sizeof(arguments) - 1;
+
+			if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+			    strstr(arguments, "glsb3=1") != NULL) {
+				give_the_renderer_a_shader(40, shadow_blur_source);
+			}
+		}
+	}
+	say("hakios: window server hooks %s\n", orig_is_ready && orig_ignore_update_p && orig_begin_update &&
+	    orig_finish_update && orig_renderer && orig_render_update ? "installed" : "INCOMPLETE");
+}
+
+/* ---- backboardd: no ambient light sensor ------------------------------------------------------------ */
+
+/*
+ * CoreBrightness (-[BLControl waitForALSArrival], called while the window server starts) waits
+ * five seconds for the ambient light sensor to turn up among the HID services. There is none
+ * and none will come: do not wait for that.
+ *
+ * Wait for something else instead, at this convenient point: our own touch screen service.
+ * backboardd takes for its touch screen a service that is there when its touch processing
+ * starts, a moment later; one that turns up afterwards it does not notice. (For as long as
+ * the five seconds were waited here, ours was always in time by accident.)
+ */
+static dispatch_semaphore_t input_services_made;
+
+static void
+wait_for_als_arrival(__unused id self, __unused SEL selector)
+{
+	if (input_services_made != NULL &&
+	    dispatch_semaphore_wait(input_services_made, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0) {
+		say("hakios: input: no touch screen service after five seconds; going on without\n");
+	}
+}
+
+__attribute__((unused)) static void
+brightness_fixes(void)
+{
+	Class cls = objc_getClass("BLControl");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("waitForALSArrival")) : NULL;
+	IMP original = method ? method_getImplementation(method) : NULL;
+
+	if (original == NULL || (uintptr_t)original != AT(0x1af043734UL, 0x1af0a672cUL, 0x1b2042b24UL) + slide) {
+		say("hakios: -[BLControl waitForALSArrival]: found %#lx, not what was expected; left alone\n",
+		    original ? (uintptr_t)original - slide : 0);
+		return;
+	}
+	method_setImplementation(method, (IMP)wait_for_als_arrival);
+}
+
+/*
+ * Boot-arg cb_watch=1: what CoreBrightness hands its CoreAnimation manager for the display's brightness
+ * (-[CBCAManager displayBrightnessPropertyHandler:], the step before "pushing nits to CA") said, the first 20 times:
+ * it says "Unexpected nits type" on this machine and pushes nothing (TODO 22).
+ */
+/* (marked unavailable in the iOS SDK's header, there in the system's IOKit: CoreBrightness sets its properties so) */
+extern kern_return_t registry_set_property(io_registry_entry_t entry, CFStringRef key, CFTypeRef value)
+    __asm__("_IORegistryEntrySetCFProperty");
+
+static IMP cb_handler_original;
+static unsigned cb_handler_said, cb_bridged_said;
+static bool cb_watching;
+static io_service_t cb_backlight;
+
+/*
+ * THE BRIGHTNESS BRIDGE (always, in backboardd): the nits CoreBrightness hands CoreAnimation for the display ("Nits", the
+ * slider's and auto-brightness's, ramped) go to the kernel's backlight too, as hakios-nits (16.16): the panel's own
+ * level follows them. CoreBrightness's own way to the backlight -- the physical nits, brightness-nits -- stays at a
+ * wake's first value here (its ramp to the hardware never runs: NitsPhysical stays 1; TODO 22), so the kernel takes
+ * the panel's level from these.
+ */
+static void
+cb_bridge(id property)
+{
+	CFTypeRef nits;
+	float value = 0;
+
+	if (property == NULL || CFGetTypeID((CFTypeRef)property) != CFDictionaryGetTypeID() ||
+	    (nits = CFDictionaryGetValue((CFDictionaryRef)property, CFSTR("Nits"))) == NULL ||
+	    CFGetTypeID(nits) != CFNumberGetTypeID() || !CFNumberGetValue((CFNumberRef)nits, kCFNumberFloatType, &value)) {
+		return;
+	}
+	if (cb_backlight == MACH_PORT_NULL) {
+		cb_backlight = IOServiceGetMatchingService(0, IOServiceMatching("AppleARMBacklight"));
+	}
+	if (cb_backlight != MACH_PORT_NULL && value >= 0 && value < 32768) {
+		int32_t fixed = (int32_t)(value * 65536.0f);
+		CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt32Type, &fixed);
+		kern_return_t kr = number ? registry_set_property(cb_backlight, CFSTR("hakios-nits"), number) : KERN_FAILURE;
+
+		if (number) {
+			CFRelease(number);
+		}
+		if (cb_bridged_said < 12 || kr != KERN_SUCCESS) {
+			cb_bridged_said++;
+			say("hakios: brightness: %.1f nits to the backlight%s\n", value, kr == KERN_SUCCESS ? "" : " (REFUSED)");
+		}
+	}
+}
+
+static void cb_brightness_again(void);
+static id cb_last_brightness;
+static uint64_t cb_again_at[5];         /* the last replays' times (mach_absolute_time) */
+
+/* CoreBrightness's "Brightness 0, 1 nit" while backboardd's slider says more (seen after the boot's freeze and a wake:
+ * the display then dim until the slider was moved, the tester 11-11): the slider's value set again, 0.4 s later -- at
+ * most once in 2 s and five times in 30 s */
+static void
+cb_maybe_again(id property)
+{
+	CFTypeRef nits = property && CFGetTypeID((CFTypeRef)property) == CFDictionaryGetTypeID() ?
+	    CFDictionaryGetValue((CFDictionaryRef)property, CFSTR("Nits")) : NULL;
+	CFTypeRef slider = cb_last_brightness ? CFDictionaryGetValue((CFDictionaryRef)cb_last_brightness, CFSTR("Brightness")) : NULL;
+	float n = 0, b = 0;
+	uint64_t now = mach_absolute_time(), second;
+	mach_timebase_info_data_t tb;
+
+	if (nits == NULL || slider == NULL || CFGetTypeID(nits) != CFNumberGetTypeID() || CFGetTypeID(slider) != CFNumberGetTypeID() ||
+	    !CFNumberGetValue((CFNumberRef)nits, kCFNumberFloatType, &n) || !CFNumberGetValue((CFNumberRef)slider, kCFNumberFloatType, &b) ||
+	    n > 1.5f || b < 0.05f) {
+		return;
+	}
+	mach_timebase_info(&tb);
+	second = 1000000000ull * tb.denom / tb.numer;
+	if (now - cb_again_at[0] < 2 * second || (cb_again_at[4] != 0 && now - cb_again_at[4] < 30 * second)) {
+		return;
+	}
+	memmove(&cb_again_at[1], &cb_again_at[0], 4 * sizeof(cb_again_at[0]));
+	cb_again_at[0] = now;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+		cb_brightness_again();
+	});
+}
+
+static void
+cb_handler_watch(id self, SEL selector, id property)
+{
+	cb_bridge(property);
+	cb_maybe_again(property);
+	if (cb_watching && cb_handler_said < 20) {
+		CFStringRef text = property ? CFCopyDescription((CFTypeRef)property) : NULL;
+		char line[1024] = "(nil)";
+
+		cb_handler_said++;
+		if (text) {
+			CFStringGetCString(text, line, sizeof(line), kCFStringEncodingUTF8);
+			CFRelease(text);
+		}
+		for (char *c = line; *c; c++) {
+			*c = *c == '\n' ? ' ' : *c;
+		}
+		say("hakios: CoreBrightness to CoreAnimation (displayBrightnessPropertyHandler:): %s\n", line);
+	}
+	((void (*)(id, SEL, id))cb_handler_original)(self, selector, property);
+}
+
+static void cb_watch_ca(void);
+
+/* (and what the display container and the display module are given: key and value, the first 40) */
+static IMP cb_container_original, cb_module_original;
+static unsigned cb_set_said;
+
+static void
+cb_say_set(const char *who, id key, id value)
+{
+	CFStringRef k = key ? CFCopyDescription((CFTypeRef)key) : NULL, v = value ? CFCopyDescription((CFTypeRef)value) : NULL;
+	char kl[128] = "(nil)", vl[512] = "(nil)";
+
+	if (cb_set_said++ >= 40) {
+		if (k) CFRelease(k);
+		if (v) CFRelease(v);
+		return;
+	}
+	if (k) {
+		CFStringGetCString(k, kl, sizeof(kl), kCFStringEncodingUTF8);
+		CFRelease(k);
+	}
+	if (v) {
+		CFStringGetCString(v, vl, sizeof(vl), kCFStringEncodingUTF8);
+		CFRelease(v);
+	}
+	for (char *c = vl; *c; c++) {
+		*c = *c == '\n' ? ' ' : *c;
+	}
+	say("hakios: CoreBrightness %s: %s = %s\n", who, kl, vl);
+}
+
+static id cb_container;         /* the display container (and cb_last_brightness, above: the last DisplayBrightness set) */
+
+static BOOL
+cb_container_watch(id self, SEL selector, id value, id key)
+{
+	if (cb_watching) cb_say_set("container", key, value);
+	if (key != NULL && value != NULL && CFGetTypeID((CFTypeRef)key) == CFStringGetTypeID() &&
+	    CFEqual((CFTypeRef)key, CFSTR("DisplayBrightness")) && CFGetTypeID((CFTypeRef)value) == CFDictionaryGetTypeID()) {
+		id old = cb_last_brightness;
+
+		cb_last_brightness = (id)CFRetain((CFTypeRef)value);
+		if (old) {
+			CFRelease((CFTypeRef)old);
+		}
+		if (cb_container == NULL) {
+			cb_container = (id)CFRetain((CFTypeRef)self);
+		}
+	}
+	return ((BOOL (*)(id, SEL, id, id))cb_container_original)(self, selector, value, key);
+}
+
+/* the last DisplayBrightness set again (nudged by 1/10000 first, in case an unchanged one is let pass): CoreBrightness
+ * works out its nits anew and hands them CoreAnimation -- and the bridge -- as for a move of the slider */
+static void
+cb_brightness_again(void)
+{
+	/* (cb_maybe_again's times: a replay by any cause counts) */
+	CFNumberRef number;
+	float level = 0;
+
+	if (cb_container == NULL || cb_last_brightness == NULL ||
+	    (number = CFDictionaryGetValue((CFDictionaryRef)cb_last_brightness, CFSTR("Brightness"))) == NULL ||
+	    CFGetTypeID(number) != CFNumberGetTypeID() || !CFNumberGetValue(number, kCFNumberFloatType, &level)) {
+		return;
+	}
+	for (int k = 0; k < 2; k++) {
+		float v = k == 0 ? (level > 0.5f ? level - 0.0001f : level + 0.0001f) : level;
+		CFNumberRef n = CFNumberCreate(NULL, kCFNumberFloatType, &v);
+		int commit = 0;
+		CFNumberRef c = CFNumberCreate(NULL, kCFNumberIntType, &commit);
+		const void *keys[2] = { CFSTR("Brightness"), CFSTR("Commit") }, *values[2] = { n, c };
+		CFDictionaryRef d = CFDictionaryCreate(NULL, keys, values, 2, &kCFTypeDictionaryKeyCallBacks,
+		    &kCFTypeDictionaryValueCallBacks);
+
+		((BOOL (*)(id, SEL, id, id))objc_msgSend)(cb_container, sel_registerName("setProperty:forKey:"), (id)d,
+		    (id)CFSTR("DisplayBrightness"));
+		CFRelease(d);
+		CFRelease(c);
+		CFRelease(n);
+	}
+	if (cb_bridged_said < 30) {
+		say("hakios: brightness: the slider's %.3f set again (after a factor or the thaw)\n", level);
+	}
+}
+
+/*
+ * (and the bridge after a wake or a boot: CoreBrightness hands CoreAnimation the nits while the backlight's factor is 0
+ * -- 1 nit -- and nothing when the factor comes back to 1, so the panel stayed dim until the slider was moved, the
+ * tester 11-11. When the display module is given a factor, its DisplayBrightness is asked for at once and after the
+ * fade, and its nits bridged.)
+ */
+static __attribute__((unused)) void
+cb_bridge_module(id module, const char *why)
+{
+	id brightness = ((id (*)(id, SEL, id))objc_msgSend)(module, sel_registerName("copyPropertyForKey:"),
+	    (id)CFSTR("DisplayBrightness"));
+
+	if (cb_watching && cb_handler_said < 40) {
+		CFStringRef text = brightness ? CFCopyDescription((CFTypeRef)brightness) : NULL;
+		char line[512] = "(nil)";
+
+		cb_handler_said++;
+		if (text) {
+			CFStringGetCString(text, line, sizeof(line), kCFStringEncodingUTF8);
+			CFRelease(text);
+		}
+		for (char *c = line; *c; c++) {
+			*c = *c == '\n' ? ' ' : *c;
+		}
+		say("hakios: CoreBrightness's DisplayBrightness %s: %s\n", why, line);
+	}
+	cb_bridge(brightness);
+	if (brightness) {
+		CFRelease((CFTypeRef)brightness);
+	}
+}
+
+static BOOL
+cb_module_watch(id self, SEL selector, id value, id key)
+{
+	BOOL result;
+
+	if (cb_watching) cb_say_set("display module", key, value);
+	result = ((BOOL (*)(id, SEL, id, id))cb_module_original)(self, selector, value, key);
+	/* backboardd FREEZES the brightness while it starts (FreezeBrightness, BKSystemApplicationBacklightLockReason): a
+	 * value set again then is let pass, and at the thaw CoreBrightness applies what it had frozen -- 0, 1 nit (bright15).
+	 * So again at the thaw too. */
+	if (key != NULL && value != NULL && CFGetTypeID((CFTypeRef)key) == CFStringGetTypeID() &&
+	    CFEqual((CFTypeRef)key, CFSTR("FreezeBrightness")) && CFGetTypeID((CFTypeRef)value) == CFDictionaryGetTypeID()) {
+		CFTypeRef enable = CFDictionaryGetValue((CFDictionaryRef)value, CFSTR("FreezeBrightnessEnable"));
+		int on = 1;
+
+		if (enable != NULL && CFGetTypeID(enable) == CFBooleanGetTypeID()) {
+			on = CFBooleanGetValue((CFBooleanRef)enable);
+		} else if (enable != NULL && CFGetTypeID(enable) == CFNumberGetTypeID()) {
+			CFNumberGetValue((CFNumberRef)enable, kCFNumberIntType, &on);
+		}
+		if (on == 0) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+				cb_brightness_again();
+			});
+		}
+	}
+	if (key != NULL && CFGetTypeID((CFTypeRef)key) == CFStringGetTypeID() &&
+	    (CFEqual((CFTypeRef)key, CFSTR("DisplayBrightnessFactor")) ||
+	    CFEqual((CFTypeRef)key, CFSTR("DisplayBrightnessFactorWithFade")))) {
+		/* (from the main queue, not here on the module's own queue) -- only a factor that is not 0: at 0 the panel goes
+		 * dark anyway */
+		float factor = 0;
+
+		if (value != NULL && CFGetTypeID((CFTypeRef)value) == CFNumberGetTypeID() &&
+		    CFNumberGetValue((CFNumberRef)value, kCFNumberFloatType, &factor) && factor > 0) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+				cb_brightness_again();
+			});
+		}
+	}
+	return result;
+}
+
+static void
+cb_watch(void)
+{
+	Class container = objc_getClass("CBDisplayContaineriOS"), module = objc_getClass("CBDisplayModuleiOS");
+	Method m1 = container ? class_getInstanceMethod(container, sel_registerName("setPropertyNoQueue:forKey:")) : NULL;
+	Method m2 = module ? class_getInstanceMethod(module, sel_registerName("setProperty:forKey:")) : NULL;
+
+	if (m1 != NULL) {
+		cb_container_original = method_setImplementation(m1, (IMP)cb_container_watch);
+	}
+	if (m2 != NULL) {
+		cb_module_original = method_setImplementation(m2, (IMP)cb_module_watch);
+	}
+	say("hakios: cb_watch: the display container %s, the display module %s\n", m1 ? "watched" : "NOT FOUND",
+	    m2 ? "watched" : "NOT FOUND");
+	cb_watch_ca();
+}
+
+static void
+cb_watch_ca(void)
+{
+	Class cls = objc_getClass("CBCAManager");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("displayBrightnessPropertyHandler:")) : NULL;
+
+	if (method == NULL) {
+		say("hakios: cb_watch: no -[CBCAManager displayBrightnessPropertyHandler:]\n");
+		return;
+	}
+	cb_handler_original = method_setImplementation(method, (IMP)cb_handler_watch);
+	say("hakios: cb_watch: -[CBCAManager displayBrightnessPropertyHandler:] watched\n");
+}
+
+/* ---- backboardd: the touch screen and the buttons ---------------------------------------------- */
+
+/* IOKit's HID event system, the part that has no public header on Darwin (prototypes checked against 20F66) */
+typedef struct __IOHIDEvent *IOHIDEventRef;
+typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+typedef struct __IOHIDServiceClient *IOHIDServiceClientRef;
+
+/* IOHIDVirtualServiceClientCallbacksV2 */
+struct virtual_service_callbacks {
+	uint64_t version;               /* 2 */
+	void (*notification)(void *target, void *refcon, IOHIDServiceClientRef service, uint32_t type, CFDictionaryRef property);
+	Boolean (*setProperty)(void *target, void *refcon, IOHIDServiceClientRef service, CFStringRef key, CFTypeRef value);
+	CFTypeRef (*copyProperty)(void *target, void *refcon, IOHIDServiceClientRef service, CFStringRef key);
+	IOHIDEventRef (*copyEvent)(void *target, void *refcon, IOHIDServiceClientRef service, uint32_t type, IOHIDEventRef matching, uint32_t options);
+	int (*setOutputEvent)(void *target, void *refcon, IOHIDServiceClientRef service, IOHIDEventRef event);
+	CFTypeRef (*copyMatchingEvent)(void *target, void *refcon, IOHIDServiceClientRef service, CFDictionaryRef matching);
+};
+
+extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreateWithType(CFAllocatorRef allocator, int type, CFDictionaryRef attributes);
+extern void IOHIDEventSystemClientScheduleWithDispatchQueue(IOHIDEventSystemClientRef client, dispatch_queue_t queue);
+extern IOHIDServiceClientRef IOHIDVirtualServiceClientCreateWithCallbacks(IOHIDEventSystemClientRef client, CFDictionaryRef attributes,
+    const struct virtual_service_callbacks *callbacks, void *target, void *refcon);
+extern Boolean IOHIDVirtualServiceClientRemove(IOHIDServiceClientRef service);
+extern Boolean IOHIDVirtualServiceClientDispatchEvent(IOHIDServiceClientRef service, IOHIDEventRef event);
+extern IOHIDEventRef IOHIDEventCreateDigitizerEvent(CFAllocatorRef allocator, uint64_t time, uint32_t transducer, uint32_t index,
+    uint32_t identity, uint32_t event_mask, uint32_t button_mask, double x, double y, double z, double tip_pressure,
+    double barrel_pressure, double twist, Boolean range, Boolean touch, uint32_t options);
+extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(CFAllocatorRef allocator, uint64_t time, uint32_t index, uint32_t identity,
+    uint32_t event_mask, double x, double y, double z, double tip_pressure, double twist, Boolean range, Boolean touch,
+    uint32_t options);
+extern IOHIDEventRef IOHIDEventCreateKeyboardEvent(CFAllocatorRef allocator, uint64_t time, uint32_t usage_page, uint32_t usage,
+    Boolean down, uint32_t options);
+extern void IOHIDEventAppendEvent(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
+extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFIndex value);
+
+#define HID_CLIENT_SIMPLE               4       /* a client that only sends */
+#define HID_CLIENT_RATE_CONTROLLED      3       /* what IOHIDEventSystemClientCreate() makes */
+#define HID_PAGE_DIGITIZER              0x0d
+#define HID_USAGE_TOUCH_SCREEN          0x04
+#define HID_PAGE_CONSUMER               0x0c
+#define HID_USAGE_CONSUMER_CONTROL      0x01
+#define HID_PAGE_TELEPHONY              0x0b
+#define HID_USAGE_TELEPHONY_PHONE       0x01
+#define HID_USAGE_POWER                 0x30    /* the lock button */
+#define HID_USAGE_MENU                  0x40    /* the home button */
+#define HID_USAGE_VOLUME_UP             0xe9
+#define HID_USAGE_VOLUME_DOWN           0xea
+#define DIGITIZER_HAND                  3       /* kIOHIDDigitizerTransducerTypeHand */
+#define DIGITIZER_RANGE                 0x1     /* event mask: what has changed */
+#define DIGITIZER_TOUCH                 0x2
+#define DIGITIZER_POSITION              0x4
+#define DIGITIZER_FROM_EDGE_TIP         0x800   /* not a change: this finger came in over an edge of the screen */
+#define FIELD_IS_BUILT_IN               0x4
+#define FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xb0019
+
+#define MAX_FINGERS     10
+
+/*
+ * A finger that lands this close to an edge of the screen (a fraction of the width or the height)
+ * is said to have come in over that edge. Apple's touch controller tells that from the shape of
+ * the contact and marks the finger's events; UIKit's screen edge recognizers (the swipe up that
+ * leaves an application, the swipe back in a navigation stack, the pull down from the top) take
+ * no touch that is not so marked, whatever its path. All we have is where the finger landed.
+ */
+#define EDGE_SIDE       (16.0 / 375)
+#define EDGE_TOP        (16.0 / 812)
+#define EDGE_BOTTOM     (34.0 / 812)    /* the strip below the applications' content, where the home bar is */
+
+static struct {
+	bool touching, edge;
+	double x, y;
+} fingers[MAX_FINGERS];
+
+static CFNumberRef
+number(int value)
+{
+	return CFNumberCreate(NULL, kCFNumberIntType, &value);
+}
+
+/* A service of ours (the callbacks' refcon): what it says of itself, and whether the event server has taken it. */
+struct service {
+	CFMutableDictionaryRef properties;
+	volatile bool opened;
+};
+
+/* The properties of a service of ours; the event server asks for them one at a time. */
+static CFTypeRef
+service_copy_property(__unused void *target, void *refcon, __unused IOHIDServiceClientRef service, CFStringRef key)
+{
+	static CFMutableSetRef asked;
+	CFTypeRef value = CFDictionaryGetValue(((struct service *)refcon)->properties, key);
+
+	if (asked == NULL) {
+		asked = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
+	}
+	if (value == NULL && !CFSetContainsValue(asked, key) && CFSetGetCount(asked) < 40) {
+		char name[96] = "?";
+
+		CFSetAddValue(asked, key);
+		CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8);
+		say("hakios: input: the event server asks for property \"%s\", which we do not have\n", name);
+	}
+	return value ? CFRetain(value) : NULL;
+}
+
+/*
+ * What the window server last asked of the touch screen ("TouchDetectionMode"), in the low
+ * byte: 1 = report touches; TOUCH_MODE_WAKE while the display is off and a tap is to wake it
+ * -- which Apple's multitouch controller then does on its own; TOUCH_MODE_OFF = nothing at
+ * all. (Seen: 0xff and 0xfe during the boot, 0x1 with the display on, 0x1fe after the lock
+ * button.)
+ */
+#define TOUCH_MODE_WAKE         0xfe
+#define TOUCH_MODE_OFF          0xff
+static volatile int touch_mode;
+
+/* What the event server tells a service of ours: said once per name, to learn what there is. */
+static Boolean
+service_set_property(__unused void *target, void *refcon, __unused IOHIDServiceClientRef service, CFStringRef key,
+    CFTypeRef value)
+{
+	static CFMutableSetRef told;
+	char name[96] = "?", text[160] = "?";
+	CFStringRef description;
+
+	{
+		/* (the sensor services: every property set, with the service's name -- who configures them) */
+		CFStringRef product = CFDictionaryGetValue(((struct service *)refcon)->properties, CFSTR("Product"));
+		char pname[64] = "", kname[64] = "", vtext[96] = "";
+		static unsigned said;
+
+		if (product != NULL && key != NULL && CFStringGetCString(product, pname, sizeof(pname), kCFStringEncodingUTF8) &&
+		    (strstr(pname, "accelerometer") || strstr(pname, "orientation")) && said++ < 60) {
+			CFStringRef d = value ? CFCopyDescription(value) : NULL;
+
+			CFStringGetCString(key, kname, sizeof(kname), kCFStringEncodingUTF8);
+			if (d) { CFStringGetCString(d, vtext, sizeof(vtext), kCFStringEncodingUTF8); CFRelease(d); }
+			say("hakios: sensors: \"%s\" set %s = %.80s\n", pname, kname, vtext);
+		}
+	}
+	/* the last thing the event server does when it opens a service; see make_service() */
+	if (key != NULL && value != NULL && CFEqual(key, CFSTR("DeviceOpenedByEventSystem")) &&
+	    CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue(value)) {
+		((struct service *)refcon)->opened = true;
+	}
+	if (key != NULL && value != NULL && CFEqual(key, CFSTR("TouchDetectionMode")) && CFGetTypeID(value) == CFNumberGetTypeID()) {
+		int mode = 0;
+
+		CFNumberGetValue(value, kCFNumberIntType, &mode);
+		if (mode != touch_mode) {
+			say("hakios: input: touch detection mode %#x\n", mode);
+		}
+		touch_mode = mode;
+	}
+	if (told == NULL) {
+		told = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
+	}
+	if (key != NULL && !CFSetContainsValue(told, key) && CFSetGetCount(told) < 24) {
+		CFSetAddValue(told, key);
+		CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8);
+		description = value ? CFCopyDescription(value) : NULL;
+		if (description != NULL) {
+			CFStringGetCString(description, text, sizeof(text), kCFStringEncodingUTF8);
+			CFRelease(description);
+		}
+		say("hakios: input: the event server sets \"%s\" = %s\n", name, text);
+	}
+	return true;
+}
+
+static void
+service_notification(__unused void *target, void *refcon, __unused IOHIDServiceClientRef service,
+    uint32_t type, CFDictionaryRef property)
+{
+	/* (the sensor services: what the event server tells them -- clients coming and going, with what it says of them) */
+	CFStringRef product = refcon ? CFDictionaryGetValue(((struct service *)refcon)->properties, CFSTR("Product")) : NULL;
+	char pname[64] = "", text[400] = "";
+	static unsigned said;
+
+	if (product != NULL && CFStringGetCString(product, pname, sizeof(pname), kCFStringEncodingUTF8) &&
+	    (strstr(pname, "accelerometer") || strstr(pname, "orientation")) && said++ < 30) {
+		CFStringRef d = property ? CFCopyDescription(property) : NULL;
+
+		if (d) { CFStringGetCString(d, text, sizeof(text), kCFStringEncodingUTF8); CFRelease(d); }
+		for (char *c = text; *c; c++) if (*c == '\n') *c = ' ';
+		say("hakios: sensors: \"%s\" notification %u: %.300s\n", pname, type, text);
+	}
+}
+
+static IOHIDEventRef sensor_copy_event(void *target, void *refcon, IOHIDServiceClientRef service, uint32_t type,
+    IOHIDEventRef matching, uint32_t options);
+static const struct virtual_service_callbacks service_callbacks = {
+	.version = 2, .notification = service_notification, .setProperty = service_set_property,
+	.copyProperty = service_copy_property, .copyEvent = sensor_copy_event,
+};
+
+/*
+ * A HID service of ours inside the event server: built in, with one usage.
+ *
+ * The event server is this very program, and it is still starting. A client that reaches it at
+ * the wrong moment of that (backboardd's "HID system open ... start": the connection is made
+ * and then replaced, "IOHIDEventSystemServer died. Reestablishing connection.") is left with a
+ * service the server cannot talk to and never opens -- and a touch screen that backboardd waits
+ * for in vain ("still waiting for a main screen digitizer"). When that moment comes depends on
+ * how fast the machine is and on how many processors it has, so no fixed delay avoids it:
+ * the service is made again until the server has opened it.
+ */
+static IOHIDServiceClientRef
+make_service2(IOHIDEventSystemClientRef client, const char *product, int page, int usage, int page2, int usage2, bool display);
+
+static IOHIDServiceClientRef
+make_service(IOHIDEventSystemClientRef client, const char *product, int page, int usage, bool display)
+{
+	return make_service2(client, product, page, usage, 0, 0, display);
+}
+
+/* the same with a second usage pair (PAGE2 0: none) */
+static IOHIDServiceClientRef
+make_service2(IOHIDEventSystemClientRef client, const char *product, int page, int usage, int page2, int usage2, bool display)
+{
+	struct service *made = calloc(1, sizeof(*made));
+	IOHIDServiceClientRef service = NULL;
+	CFMutableDictionaryRef properties = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	CFMutableDictionaryRef pair = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	CFStringRef name = CFStringCreateWithCString(NULL, product, kCFStringEncodingUTF8);
+	CFNumberRef page_number = number(page), usage_number = number(usage), zero = number(0);
+	CFArrayRef pairs;
+
+	CFDictionarySetValue(pair, CFSTR("DeviceUsagePage"), page_number);
+	CFDictionarySetValue(pair, CFSTR("DeviceUsage"), usage_number);
+	if (page2 != 0) {
+		CFMutableDictionaryRef second = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+		    &kCFTypeDictionaryValueCallBacks);
+		CFNumberRef p2 = number(page2), u2 = number(usage2);
+		const void *both[2] = { pair, second };
+
+		CFDictionarySetValue(second, CFSTR("DeviceUsagePage"), p2);
+		CFDictionarySetValue(second, CFSTR("DeviceUsage"), u2);
+		pairs = CFArrayCreate(NULL, both, 2, &kCFTypeArrayCallBacks);
+		CFRelease(p2);
+		CFRelease(u2);
+		CFRelease(second);
+	} else {
+		pairs = CFArrayCreate(NULL, (const void **)&pair, 1, &kCFTypeArrayCallBacks);
+	}
+	CFDictionarySetValue(properties, CFSTR("PrimaryUsagePage"), page_number);
+	CFDictionarySetValue(properties, CFSTR("PrimaryUsage"), usage_number);
+	CFDictionarySetValue(properties, CFSTR("DeviceUsagePage"), page_number);
+	CFDictionarySetValue(properties, CFSTR("DeviceUsage"), usage_number);
+	CFDictionarySetValue(properties, CFSTR("DeviceUsagePairs"), pairs);
+	CFDictionarySetValue(properties, CFSTR("Built-In"), kCFBooleanTrue);
+	CFDictionarySetValue(properties, CFSTR("Transport"), CFSTR("SPI"));
+	CFDictionarySetValue(properties, CFSTR("Manufacturer"), CFSTR("akita"));
+	CFDictionarySetValue(properties, CFSTR("Product"), name);
+	CFDictionarySetValue(properties, CFSTR("VendorID"), zero);
+	CFDictionarySetValue(properties, CFSTR("ProductID"), zero);
+	if (display) {
+		CFDictionarySetValue(properties, CFSTR("DisplayIntegrated"), kCFBooleanTrue);
+	}
+	/* the dictionary stays: it is what service_copy_property() answers from */
+	made->properties = properties;
+	for (int attempt = 1; attempt <= 20; attempt++) {
+		made->opened = false;
+		service = IOHIDVirtualServiceClientCreateWithCallbacks(client, properties, &service_callbacks, NULL, made);
+		if (service == NULL) {
+			break;
+		}
+		for (int tenths = 0; tenths < 20 && !made->opened; tenths++) {
+			usleep(100000);
+		}
+		if (made->opened) {
+			break;
+		}
+		say("hakios: input: the event server has not opened \"%s\" (attempt %d): making it again\n", product, attempt);
+		IOHIDVirtualServiceClientRemove(service);
+		CFRelease(service);
+		service = NULL;
+	}
+	return service;
+}
+
+/*
+ * THE MOTION SENSORS AS iOS TAKES THEM (11-20): on the iPhone 13 mini the accelerometer (and gyro, compass, light and
+ * proximity sensors) are HID services of the always-on processor, Apple's vendor page 0xff00 -- usages 3
+ * (accelerometer), 9 (gyro); backboardd and CoreMotion find them by those. Here a virtual service of ours stands for
+ * the accelerometer, fed from the Pixel's sensors once they are read (TODO 34: the AoC's USF); until then, with
+ * boot-arg accel_fake=X,Y,Z (in g, as an iPhone: upright portrait is 0,-1,0), that vector fifty times a second -- to
+ * see who opens the service and whether the interface turns.
+ */
+#define HID_PAGE_APPLE_VENDOR           0xff00
+#define HID_USAGE_ACCELEROMETER         0x03
+#define HID_USAGE_GYRO                  0x09
+extern IOHIDEventRef IOHIDEventCreateAccelerometerEvent(CFAllocatorRef allocator, uint64_t time, double x, double y, double z,
+    uint32_t options);
+
+static IOHIDServiceClientRef accelerometer;
+static double accel_fake[3];
+static bool accel_fake_on;
+
+/*
+ * ... AND THE DEVICE'S ORIENTATION, which the always-on processor works out itself and CoreMotion's
+ * CMDeviceOrientationManager takes (IOHIDFamily's IOHIDEventDriver: a service of the HID sensor page 0x20, usage 0x8a,
+ * "Device Orientation"; orientation events of type CMUsage, the orientation a usage of Apple's motion page 0xff0c --
+ * ambiguous, portrait, upside down, landscape left, landscape right, face up, face down from BASE on; Apple's test
+ * descriptor has them from 0x64; orient_base=0x20 for the other numbering seen).
+ */
+#define HID_PAGE_SENSOR                 0x20
+#define HID_USAGE_DEVICE_ORIENTATION    0x8a
+#define EVENT_TYPE_ORIENTATION          10
+#define ORIENTATION_TYPE_CMUSAGE        1
+#define FIELD_ORIENTATION_TYPE          (EVENT_TYPE_ORIENTATION << 16 | 3)
+#define FIELD_ORIENTATION_USAGE         (EVENT_TYPE_ORIENTATION << 16 | 4)
+enum { ORIENT_AMBIGUOUS, ORIENT_PORTRAIT, ORIENT_UPSIDE_DOWN, ORIENT_LANDSCAPE_LEFT, ORIENT_LANDSCAPE_RIGHT, ORIENT_FACE_UP,
+	ORIENT_FACE_DOWN };
+extern IOHIDEventRef IOHIDEventCreateOrientationEvent(CFAllocatorRef allocator, uint64_t time, double x, double y, double z,
+    uint32_t options);
+static IOHIDServiceClientRef orientation_service;
+static IOHIDEventRef orientation_last;          /* (what copyEvent answers) */
+static unsigned orient_base = 0x64;
+
+/* the orientation a gravity vector (in g, an iPhone's axes) gives; WAS where there is no clear answer */
+static int
+orientation_of(const double g[3], int was)
+{
+	double ax = fabs(g[0]), ay = fabs(g[1]), az = fabs(g[2]);
+
+	if (az > 0.8) return g[2] < 0 ? ORIENT_FACE_UP : ORIENT_FACE_DOWN;
+	if (ay > 0.6 && ay > ax) return g[1] < 0 ? ORIENT_PORTRAIT : ORIENT_UPSIDE_DOWN;
+	if (ax > 0.6 && ax > ay) return g[0] < 0 ? ORIENT_LANDSCAPE_LEFT : ORIENT_LANDSCAPE_RIGHT;
+	return was;
+}
+
+static void
+send_orientation(int orientation)
+{
+	IOHIDEventRef e = IOHIDEventCreateOrientationEvent(NULL, mach_absolute_time(), 0, 0, 0, 0);
+
+	if (e == NULL || orientation_service == NULL) {
+		return;
+	}
+	IOHIDEventSetIntegerValue(e, FIELD_ORIENTATION_TYPE, ORIENTATION_TYPE_CMUSAGE);
+	IOHIDEventSetIntegerValue(e, FIELD_ORIENTATION_USAGE, (CFIndex)(orient_base + (unsigned)orientation));
+	IOHIDVirtualServiceClientDispatchEvent(orientation_service, e);
+	if (orientation_last != NULL) CFRelease(orientation_last);
+	orientation_last = e;
+	static unsigned said;
+
+	if (said++ < 4) say("hakios: sensors: orientation %d (usage %#x) sent\n", orientation, orient_base + (unsigned)orientation);
+}
+
+/* copyEvent of the sensor services: the last orientation event (Apple's own test asks the service so) */
+static IOHIDEventRef
+sensor_copy_event(__unused void *target, __unused void *refcon, __unused IOHIDServiceClientRef service, uint32_t type,
+    __unused IOHIDEventRef matching, __unused uint32_t options)
+{
+	static unsigned said;
+
+	if (said++ < 6) say("hakios: sensors: copyEvent of type %u asked\n", type);
+	return type == EVENT_TYPE_ORIENTATION && orientation_last != NULL ? (IOHIDEventRef)CFRetain(orientation_last) : NULL;
+}
+
+static void *
+accelerometer_feed(__unused void *unused)
+{
+	unsigned sent = 0;
+	int orientation = -1;
+
+	for (;;) {
+		if (!accel_fake_on) {
+			/* the real accelerometer (kern.hakios.motion, the AoC's): m/s2 as Android has it -- the reaction to gravity,
+			 * +9.8 on z face up -- where an iPhone reports g the other way (face up: z = -1) */
+			struct { uint32_t version, accel_seq, light_seq, proximity_seq; uint64_t accel_ns; float accel[3], lux, proximity; } m;
+			size_t n = sizeof(m);
+
+			if (sysctlbyname("kern.hakios.motion", &m, &n, NULL, 0) == 0 && n == sizeof(m) && m.accel_seq != 0) {
+				static bool first = true;
+
+				for (int k = 0; k < 3; k++) {
+					accel_fake[k] = -m.accel[k] / 9.80665;
+				}
+				if (first) {
+					first = false;
+					say("hakios: sensors: the AoC's accelerometer reached (%.2f %.2f %.2f g)\n", accel_fake[0], accel_fake[1], accel_fake[2]);
+				}
+			}
+		}
+		int now = orientation_of(accel_fake, orientation < 0 ? ORIENT_PORTRAIT : orientation);
+
+		/* (and again every half second: a client that subscribes later -- CoreMotion's, seconds after the service is
+		 * there -- gets no event dispatched before it did) */
+		if (now != orientation || sent % 25 == 0) {
+			if (now != orientation) {
+				say("hakios: sensors: the orientation now %d (%.2f %.2f %.2f g)\n", now, accel_fake[0], accel_fake[1], accel_fake[2]);
+			}
+			orientation = now;
+			send_orientation(orientation);
+		}
+		IOHIDEventRef e = IOHIDEventCreateAccelerometerEvent(NULL, mach_absolute_time(), accel_fake[0], accel_fake[1], accel_fake[2], 0);
+
+		if (e != NULL) {
+			IOHIDVirtualServiceClientDispatchEvent(accelerometer, e);
+			CFRelease(e);
+			if (sent++ == 0) {
+				say("hakios: sensors: the first accelerometer event sent (%.2f %.2f %.2f g)\n", accel_fake[0], accel_fake[1], accel_fake[2]);
+			}
+		}
+		usleep(20000);
+	}
+	return NULL;
+}
+
+static void
+sensor_services(IOHIDEventSystemClientRef client)
+{
+	char args[1024] = { 0 };
+	size_t size = sizeof(args) - 1;
+	const char *at;
+	pthread_t thread;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "accel_fake=")) != NULL &&
+	    sscanf(at + 11, "%lf,%lf,%lf", &accel_fake[0], &accel_fake[1], &accel_fake[2]) == 3) {
+		accel_fake_on = true;
+	}
+	if (!accel_fake_on) {
+		/* the real one when the kernel has the AoC's sensors (usf=2: kern.hakios.motion); else no service at all, so
+		 * that nothing waits on one that stays still */
+		size_t n = 0;
+
+		if (sysctlbyname("kern.hakios.motion", NULL, &n, NULL, 0) != 0 || n == 0) {
+			return;
+		}
+		accel_fake[1] = -1;     /* (upright until the first sample) */
+	}
+	if ((at = strstr(args, "orient_base=")) != NULL) {
+		orient_base = (unsigned)strtoul(at + 12, NULL, 0);
+	}
+	accelerometer = make_service(client, "HakiOS accelerometer", HID_PAGE_APPLE_VENDOR, HID_USAGE_ACCELEROMETER, false);
+	orientation_service = make_service(client, "HakiOS device orientation", HID_PAGE_SENSOR, HID_USAGE_DEVICE_ORIENTATION, false);
+	say("hakios: sensors: accelerometer service %p, orientation service %p (usages from %#x)\n", (void *)accelerometer,
+	    (void *)orientation_service, orient_base);
+	if (accelerometer != NULL) {
+		pthread_create(&thread, NULL, accelerometer_feed, NULL);
+		pthread_detach(thread);
+	}
+}
+
+/* One frame of the touch screen: the hand, and under it every finger that is down or has just lifted. */
+static void
+send_touch(IOHIDServiceClientRef screen, const struct hakios_touch *t)
+{
+	uint32_t change = t->type == HAKIOS_TOUCH_MOVE ? DIGITIZER_POSITION : DIGITIZER_RANGE | DIGITIZER_TOUCH;
+	IOHIDEventRef hand, finger;
+	bool any = false;
+	unsigned f = t->finger;
+
+	if (f >= MAX_FINGERS || (t->type != HAKIOS_TOUCH_DOWN && !fingers[f].touching)) {
+		return;
+	}
+	fingers[f].touching = t->type != HAKIOS_TOUCH_UP;
+	fingers[f].x = t->x / 65535.0;
+	fingers[f].y = t->y / 65535.0;
+	if (t->type == HAKIOS_TOUCH_DOWN) {
+		fingers[f].edge = fingers[f].x < EDGE_SIDE || fingers[f].x > 1 - EDGE_SIDE || fingers[f].y < EDGE_TOP ||
+		    fingers[f].y > 1 - EDGE_BOTTOM;
+	}
+	for (unsigned i = 0; i < MAX_FINGERS; i++) {
+		any |= fingers[i].touching;
+	}
+
+	hand = IOHIDEventCreateDigitizerEvent(NULL, t->time, DIGITIZER_HAND, 0, 0, change & ~DIGITIZER_RANGE, 0, fingers[f].x,
+	    fingers[f].y, 0, 0, 0, 0, any, any, 0);
+	IOHIDEventSetIntegerValue(hand, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
+	IOHIDEventSetIntegerValue(hand, FIELD_IS_BUILT_IN, 1);
+	for (unsigned i = 0; i < MAX_FINGERS; i++) {
+		if (!fingers[i].touching && i != f) {
+			continue;
+		}
+		finger = IOHIDEventCreateDigitizerFingerEvent(NULL, t->time, i + 1, i + 2,
+		    (i == f ? change : 0) | (fingers[i].edge ? DIGITIZER_FROM_EDGE_TIP : 0), fingers[i].x, fingers[i].y, 0,
+		    fingers[i].touching ? 1.0 : 0.0, 0, fingers[i].touching, fingers[i].touching, 0);
+		IOHIDEventSetIntegerValue(finger, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
+		IOHIDEventAppendEvent(hand, finger, 0);
+		CFRelease(finger);
+	}
+	IOHIDVirtualServiceClientDispatchEvent(screen, hand);
+	CFRelease(hand);
+}
+
+/*
+ * Whether the side button is held right now, for our code in SpringBoard (inject_sb.c,
+ * lock_long_press()): kept as the state of a Darwin notification, 2 = held, 1 = released
+ * (0, what a name nobody has set says, = not known), and set before the event is sent.
+ */
+static void
+publish_lock_button(bool down)
+{
+	static int token = NOTIFY_TOKEN_INVALID;
+
+	if (token == NOTIFY_TOKEN_INVALID && notify_register_check("com.hakios.button.lock", &token) != NOTIFY_STATUS_OK) {
+		token = NOTIFY_TOKEN_INVALID;
+		return;
+	}
+	notify_set_state(token, down ? 2 : 1);
+}
+
+static void
+send_button(IOHIDServiceClientRef buttons, const struct hakios_touch *t)
+{
+	uint32_t usage = t->finger == HAKIOS_BUTTON_LOCK ? HID_USAGE_POWER : t->finger == HAKIOS_BUTTON_HOME ? HID_USAGE_MENU :
+	    t->finger == HAKIOS_BUTTON_VOLUME_UP ? HID_USAGE_VOLUME_UP : t->finger == HAKIOS_BUTTON_VOLUME_DOWN ?
+	    HID_USAGE_VOLUME_DOWN : 0;
+	IOHIDEventRef event;
+
+	if (usage == 0) {
+		return;
+	}
+	if (t->finger == HAKIOS_BUTTON_LOCK) {
+		publish_lock_button(t->type == HAKIOS_BUTTON_DOWN);
+	}
+	event = IOHIDEventCreateKeyboardEvent(NULL, t->time, HID_PAGE_CONSUMER, usage, t->type == HAKIOS_BUTTON_DOWN, 0);
+	IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
+	IOHIDVirtualServiceClientDispatchEvent(buttons, event);
+	CFRelease(event);
+}
+
+/*
+ * Boot-arg touch_lat=1: a line for every touch sample, "tl: i TYPE posted US read US sent US" -- when
+ * the kernel stamped it, when this thread had it, when the event system had the event -- in
+ * microseconds of mach_absolute_time, the kernel's own time (tools/latency.py).
+ */
+static bool touch_latency;
+static mach_timebase_info_data_t timebase;
+
+static uint64_t
+micros(uint64_t absolute)
+{
+	return absolute * timebase.numer / timebase.denom / 1000;
+}
+
+static void *
+input_thread(__unused void *arg)
+{
+	static const int types[] = { HID_CLIENT_SIMPLE, HID_CLIENT_RATE_CONTROLLED };
+	IOHIDEventSystemClientRef client = NULL;
+	IOHIDServiceClientRef screen = NULL, buttons = NULL;
+	struct hakios_touch t;
+	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
+	int device;
+
+	pthread_setname_np("akita input");
+	{
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+			touch_latency = strstr(arguments, "touch_lat=1") != NULL;
+		}
+		mach_timebase_info(&timebase);
+	}
+	device = open(HAKIOS_TOUCH_DEVICE, O_RDONLY);
+	if (device < 0) {
+		say("hakios: input: %s: %s\n", HAKIOS_TOUCH_DEVICE, strerror(errno));
+		return NULL;
+	}
+	sleep(3);                       /* let backboardd get as far as starting its event server */
+	for (unsigned i = 0; screen == NULL && i < sizeof(types) / sizeof(types[0]); i++) {
+		/* this waits until the server (this very program) answers */
+		client = IOHIDEventSystemClientCreateWithType(NULL, types[i], NULL);
+		if (client == NULL) {
+			say("hakios: input: no HID client of type %d\n", types[i]);
+			continue;
+		}
+		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("akita.input", NULL));
+		screen = make_service(client, "HakiOS touch screen", HID_PAGE_DIGITIZER, HID_USAGE_TOUCH_SCREEN, true);
+		if (screen == NULL) {
+			say("hakios: input: a HID client of type %d may not create services\n", types[i]);
+		}
+	}
+	if (screen != NULL) {
+		/*
+		 * The buttons as an iPhone's built-in button service shows itself: primary usage Telephony / Phone, with
+		 * Consumer Control as its second pair (the lock and volume keys' events are of that page). ButtonResolver's
+		 * legacy interface (backboardd) takes the first built-in service of 0x0b/0x01 (or 0xff00/0x0b) and is not ready
+		 * until it has one -- and backboardd's virtual framebuffer workloop waits for it to be ready, with Setup's
+		 * screen recording and SpringBoard's main thread behind it (11-23: Setup frozen at the language/region pages).
+		 */
+		buttons = make_service2(client, "HakiOS buttons", HID_PAGE_TELEPHONY, HID_USAGE_TELEPHONY_PHONE, HID_PAGE_CONSUMER,
+		    HID_USAGE_CONSUMER_CONTROL, false);
+	}
+	if (screen != NULL) {
+		sensor_services(client);
+	}
+	say("hakios: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
+	dispatch_semaphore_signal(input_services_made); /* see wait_for_als_arrival() */
+	if (screen == NULL) {
+		return NULL;
+	}
+
+	while (read(device, &t, sizeof(t)) == (ssize_t)sizeof(t)) {
+		uint64_t read_at = mach_absolute_time();
+
+		if (count++ < 4) {
+			say("hakios: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
+		}
+		if (t.type > HAKIOS_TOUCH_UP) {
+			if (buttons != NULL) {
+				send_button(buttons, &t);
+			}
+		} else if (t.type == HAKIOS_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL) {
+			/*
+			 * The display is off and a tap is to wake it. The lock button is what wakes it here:
+			 * press it for the finger, and keep the rest of this touch to ourselves.
+			 */
+			struct hakios_touch press = { .time = t.time, .type = HAKIOS_BUTTON_DOWN, .finger = HAKIOS_BUTTON_LOCK };
+
+			send_button(buttons, &press);
+			press.type = HAKIOS_BUTTON_UP;
+			send_button(buttons, &press);
+			waking |= 1u << (t.finger & 31);
+		} else if (waking & (1u << (t.finger & 31))) {
+			if (t.type == HAKIOS_TOUCH_UP) {
+				waking &= ~(1u << (t.finger & 31));
+			}
+		} else {
+			send_touch(screen, &t);
+			if (touch_latency) {
+				say("tl: i %u posted %llu read %llu sent %llu\n", t.type, micros(t.time), micros(read_at),
+				    micros(mach_absolute_time()));
+			}
+		}
+	}
+	say("hakios: input: %s: %s\n", HAKIOS_TOUCH_DEVICE, strerror(errno));
+	return NULL;
+}
+
+static void
+input_start(void)
+{
+	pthread_t thread;
+
+	input_services_made = dispatch_semaphore_create(0);
+	if (pthread_create(&thread, NULL, input_thread, NULL) == 0) {
+		pthread_detach(thread);
+	}
+}
+
+/* ---- containermanagerd ---------------------------------------------------------------------------- */
+
+static BOOL
+personas_are_supported(__unused id self, __unused SEL selector)
+{
+	return NO;
+}
+
+static void
+container_manager_fixes(void)
+{
+	Class cls = objc_getClass("MCMUserIdentityCache");
+	Method method = cls ? class_getClassMethod(cls, sel_registerName("personasAreSupported")) : NULL;
+	IMP original = method ? method_getImplementation(method) : NULL;
+
+	if (original == NULL || (uintptr_t)original != AT(0x1c3ea6298UL, 0x1c4c699f8UL, 0x1c8a14724UL) + slide) {
+		say("hakios: +[MCMUserIdentityCache personasAreSupported]: found %#lx, not what was expected; left alone\n",
+		    original ? (uintptr_t)original - slide : 0);
+		return;
+	}
+	method_setImplementation(method, (IMP)personas_are_supported);
+	say("hakios: container manager: no personas\n");
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * An OpenGL ES implementation for CoreAnimation (src/eagl.c, Mesa behind it): loaded, it puts
+ * itself behind EAGLContext, and the renderer the server then gets is the OpenGL ES one. That
+ * is worth it where a GPU does the drawing, and only there: on the phone, when the kernel has
+ * started the GPU and keeps it (boot-arg gpu=1), which the service HakiosGPU says (it is there
+ * before the first program runs, or not at all). Everywhere else -- QEMU, a run without the
+ * boot-arg, a phone without the GPU's firmware in the image, a GPU that did not start --
+ * nothing is loaded, and CoreAnimation draws with its own software renderer as in an image
+ * without the library.
+ * Boot-arg gl=0: not even with a GPU; gl=1: also without one, by Mesa's software driver (slow;
+ * for working on eagl.c in QEMU).
+ */
+static void
+opengl_es(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *argument;
+	io_service_t gpu;
+	void *library;
+	int wanted = -1, told = 0;
+
+	if (access(HAKIOS_GL, R_OK) != 0) {
+		return;                                 /* (an image built without it) */
+	}
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		functions_said_yes(arguments);
+		compile_shaders_said = strstr(arguments, "glcompile=1") != NULL;
+		for (argument = arguments; (argument = strstr(argument, "gl=")) != NULL; argument += 3) {
+			if (argument == arguments || argument[-1] == ' ') {
+				wanted = argument[3] != '0';
+				told = 1;
+			}
+		}
+	}
+	if (wanted < 0) {
+		gpu = IOServiceGetMatchingService(0, IOServiceMatching("HakiosGPU"));
+		wanted = gpu != 0;
+		if (gpu != 0) {
+			IOObjectRelease(gpu);
+		}
+	}
+	if (!wanted) {
+		say("hakios: %s: CoreAnimation keeps its software renderer\n", told ? "gl=0" : "no GPU to draw with");
+		return;
+	}
+	if ((library = dlopen(HAKIOS_GL, RTLD_NOW)) == NULL) {
+		say("hakios: %s: %s\n", HAKIOS_GL, dlerror());
+		return;
+	}
+	gl_loaded = 1;
+	gl_function_values = (void (*)(void *, unsigned, unsigned, size_t, size_t, const float *))dlsym(library,
+	    "hakios_gl_function_values");
+	gl_function_refused = (void (*)(unsigned))dlsym(library, "hakios_gl_function_refused");
+}
+
+/*
+ * What CoreAnimation's Metal renderer looks for when it starts (CA::OGL::MetalContext asserts metallib_url != nil:
+ * this image, made for the iPhone X, has no default.metallib in QuartzCore.framework, only default.pipelinelib).
+ * Every NSBundle lookup of a "metallib" or "pipelinelib" resource in the window server is said, with what it found;
+ * boot-arg ca_metallib=PATH answers a lookup of default.metallib that found nothing with PATH.
+ */
+static id (*orig_url_for)(id self, SEL selector, id name, id extension);
+static id (*orig_url_for_in)(id self, SEL selector, id name, id extension, id subdirectory);
+static const char *ca_metallib;
+static unsigned lookups_said;
+
+static const char *
+utf8(id string)
+{
+	return string != NULL ? ((const char *(*)(id, SEL))objc_msgSend)(string, sel_registerName("UTF8String")) : "(nil)";
+}
+
+static id
+metallib_answer(id self, id name, id extension, id found)
+{
+	const char *ext = extension != NULL ? utf8(extension) : "";
+
+	if (strstr(ext, "metallib") == NULL && strstr(ext, "pipelinelib") == NULL) {
+		return found;
+	}
+	if (lookups_said++ < 40) {
+		id path = found != NULL ? ((id (*)(id, SEL))objc_msgSend)(found, sel_registerName("path")) : NULL;
+
+		say("hakios: %s asks bundle %s for %s.%s: %s\n", getprogname(),
+		    utf8(((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("bundlePath"))), utf8(name), ext,
+		    found != NULL ? utf8(path) : "nothing");
+	}
+	if (found == NULL && ca_metallib != NULL && name != NULL && strcmp(utf8(name), "default") == 0 &&
+	    strcmp(ext, "metallib") == 0) {
+		id text = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSString"),
+		    sel_registerName("stringWithUTF8String:"), ca_metallib);
+
+		return ((id (*)(Class, SEL, id))objc_msgSend)(objc_getClass("NSURL"), sel_registerName("fileURLWithPath:"), text);
+	}
+	return found;
+}
+
+static id
+my_url_for(id self, SEL selector, id name, id extension)
+{
+	return metallib_answer(self, name, extension, orig_url_for(self, selector, name, extension));
+}
+
+static id
+my_url_for_in(id self, SEL selector, id name, id extension, id subdirectory)
+{
+	return metallib_answer(self, name, extension, orig_url_for_in(self, selector, name, extension, subdirectory));
+}
+
+static void
+watch_metallib_lookups(const char *arguments)
+{
+	static char path[256];
+	const char *at = strstr(arguments, "ca_metallib=");
+	Class bundle = objc_getClass("NSBundle");
+	Method two, three;
+
+	if (at != NULL) {
+		size_t length = strcspn(at + 12, " ");
+
+		if (length < sizeof(path)) {
+			memcpy(path, at + 12, length);
+			ca_metallib = path;
+		}
+	}
+	if (bundle == NULL) {
+		return;
+	}
+	if ((two = class_getInstanceMethod(bundle, sel_registerName("URLForResource:withExtension:"))) != NULL) {
+		orig_url_for = (id (*)(id, SEL, id, id))method_setImplementation(two, (IMP)my_url_for);
+	}
+	if ((three = class_getInstanceMethod(bundle, sel_registerName("URLForResource:withExtension:subdirectory:"))) != NULL) {
+		orig_url_for_in = (id (*)(id, SEL, id, id, id))method_setImplementation(three, (IMP)my_url_for_in);
+	}
+	say("hakios: metallib lookups in %s are said%s%s\n", getprogname(), ca_metallib ? "; default.metallib is " : "",
+	    ca_metallib ? ca_metallib : "");
+}
+
+/*
+ * Boot-arg br_watch=1 (diagnostics, 11-23): ButtonResolver's controller as it describes itself, 30 and 90 s on --
+ * every interface (AOP, Legacy, Keyboard), whether it is ready, its services and slots. backboardd waits for the
+ * controller's ready notification ("_BRController ready: device haptic asset slot count") on a workloop that its
+ * virtual framebuffer service shares; while it never comes, Setup's screen recording hangs SpringBoard.
+ */
+static void
+br_say(void)
+{
+	Class cls = objc_getClass("BRButtonResolverController");
+	id controller, list, text;
+
+	if (cls == NULL) {
+		say("hakios: br_watch: no BRButtonResolverController in this process\n");
+		return;
+	}
+	controller = ((id (*)(Class, SEL))objc_msgSend)(cls, sel_registerName("sharedInstance"));
+	if (controller == NULL) {
+		say("hakios: br_watch: no controller\n");
+		return;
+	}
+	list = ((id (*)(id, SEL))objc_msgSend)(controller, sel_registerName("propertyList"));
+	text = ((id (*)(id, SEL))objc_msgSend)(list != NULL ? list : controller, sel_registerName("description"));
+	const char *utf = text != NULL ? ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String")) : "(nil)";
+	char flat[4096];
+	size_t n = 0;
+
+	/* (flattened and said in pieces of 160: the console's other writers cut a long write) */
+	for (const char *c = utf; *c != 0 && n < sizeof(flat) - 1; c++) {
+		if (*c == '\n' || *c == ' ') {
+			if (n > 0 && flat[n - 1] != ' ') flat[n++] = ' ';
+		} else {
+			flat[n++] = *c;
+		}
+	}
+	flat[n] = 0;
+	say("hakios: br_watch: isReady %d, %zu characters\n", (int)((BOOL (*)(id, SEL))objc_msgSend)(controller, sel_registerName("isReady")), n);
+	for (size_t at = 0; at < n; at += 160) {
+		say("hakios: br_watch %zu: %.160s\n", at / 160, flat + at);
+	}
+}
+
+static void
+br_watch(void)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{ br_say(); });
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 90 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{ br_say(); });
+}
+
+__attribute__((constructor))
+static void
+hakios_init(void)
+{
+	const char *name = getprogname();
+	size_t length = 0;
+	const void *cache = _dyld_get_shared_cache_range(&length);
+
+	if (name == NULL || cache == NULL) {
+		return;
+	}
+	slide = (uintptr_t)cache - CACHE_BASE;
+	if (strcmp(name, "backboardd") == 0) {
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		watch_for_faults();     /* (whichever renderer: the Metal one's crashes said nothing) */
+
+		/*
+		 * Boot-arg ca_vbl=1: CoreAnimation's frame clock from the display driver's refresh
+		 * notifications. QuartzCore takes them (IOMobileFramebufferEnableVSyncNotifications) only on
+		 * the phones with an A7 to A10, or when CA_FORCE_TIMER is in the environment
+		 * (CADeviceUseVBL()); on the iPhone X it runs a timer of its own instead (CADisplayTimer),
+		 * whose phase it would set from the frame timings of a display driver this one is not.
+		 */
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "ca_vbl=1") != NULL) {
+			setenv("CA_FORCE_TIMER", "1", 1);
+			say("hakios: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
+		}
+		/*
+		 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
+		 * CoreAnimation's own switches (CA_LOG_TRIPLE_BUFFERING=1, CA_FORCE_DOUBLE_BUFFERING=1 ...).
+		 */
+		for (const char *argument = arguments; (argument = strstr(argument, "caenv=")) != NULL; argument += 6) {
+			char setting[128];
+			size_t length = strcspn(argument + 6, " ");
+			char *equals;
+
+			if ((argument != arguments && argument[-1] != ' ') || length == 0 || length >= sizeof(setting)) {
+				continue;
+			}
+			memcpy(setting, argument + 6, length);
+			setting[length] = 0;
+			if ((equals = strchr(setting, '=')) != NULL) {
+				*equals = 0;
+				/* a fraction is written 0p25: the boot-arguments lose what follows a "." of a number (0.008 came as 0) */
+				for (char *point = equals + 1; *point != 0; point++) {
+					if (*point == 'p' && point > equals + 1 && point[-1] >= '0' && point[-1] <= '9' && point[1] >= '0' && point[1] <= '9') {
+						*point = '.';
+						break;
+					}
+				}
+				setenv(setting, equals + 1, 1);
+				say("hakios: caenv: %s=%s for the window server\n", setting, equals + 1);
+			}
+		}
+		if (strstr(arguments, "metal_watch=1") != NULL || strstr(arguments, "ca_metallib=") != NULL) {
+			watch_metallib_lookups(arguments);
+		}
+		if (strstr(arguments, "touch_lat=1") != NULL) {
+			commit_lines();
+		}
+		if (strstr(arguments, "br_watch=1") != NULL) {
+			br_watch();
+		}
+		cb_watching = strstr(arguments, "cb_watch=1") != NULL;
+		cb_watch();     /* (the brightness bridge always; the sayings with cb_watch=1) */
+		opengl_es();
+		window_server_fixes();
+		/*
+		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch
+		 * screen service for its own ("still waiting for a main screen digitizer"), whether the
+		 * service was made before or after the touch processing starts. (Most likely it only
+		 * moved the start of the event server onto the moment make_service() now knows how to
+		 * survive; not tried again since, and until it is, the five seconds stay.)
+		 */
+		input_start();
+	} else if (strncmp(name, "containermanagerd", 17) == 0) {
+		container_manager_fixes();
+	}
+}
