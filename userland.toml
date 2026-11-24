@@ -1,0 +1,202 @@
+# userland.toml: what `ak userland` builds into out/akios.apfs, the RAM disk the kernel starts from (README.md).
+#
+# Paths are relative to this repository. @NAME stands for a path of akios.toml [userland] (the toolchain, the SDK, the
+# unpacked IPSW, the firmware directory, the Metal tree ...), so that nothing here names the build machine.
+
+[image]
+file    = "akios.apfs"
+volume  = "AkIOS"
+# stored as they are and in one piece: the kernel's drivers use the firmware where it lies in the RAM disk
+plain   = ["fw"]
+# empty directories: the mount points of the plan, and /dev for devfs
+dirs    = ["dev", "flash", "Cryptexes/OS", "Cryptexes/App", "akita"]
+
+[boot]
+plan            = "etc/boot.plan.in"   # -> /etc/akios/boot.plan
+persona_timeout = 20                   # s for usermanagerd --init before it is killed
+max_vnodes      = 32768
+launchd_stderr  = "console"            # "null": launchd's own chatter dropped (the daemons keep the console)
+# the iPhone's other volumes, mounted where iOS has them when the phone has their partition (/dev/ufs_ios_*)
+ios_volumes = [
+  { dev = "ufs_ios_xarts",    at = "/private/xarts",                      mode = "0755", uid = 0,  gid = 0 },
+  { dev = "ufs_ios_sysdata",  at = "/private/system_data",                mode = "0755", uid = 0,  gid = 0 },
+  { dev = "ufs_ios_hardware", at = "/private/var/hardware",               mode = "0755", uid = 0,  gid = 0 },
+  { dev = "ufs_ios_baseband", at = "/private/var/wireless/baseband_data", mode = "0755", uid = 25, gid = 25 },
+  { dev = "ufs_ios_update",   at = "/private/var/MobileSoftwareUpdate",   mode = "0755", uid = 0,  gid = 0 },
+  { dev = "ufs_ios_vm",       at = "/private/var/vm",                     mode = "0755", uid = 0,  gid = 0 },
+]
+# log_all=1 puts libakios.log in every program but these (their signal handler would point at a page they may not
+# execute, and they spin there)
+log_all_skip = ["installd", "securityd", "timed", "mDNSResponder", "distnoted", "analyticsd", "symptomsd",
+                "diagnosticservicesd", "aonsensed"]
+
+# process 1: static, against libmini (no dyld, no libSystem)
+[akinit]
+src = ["akinit/main.c", "akinit/plan.c", "akinit/ops.c", "akinit/fsutil.c", "akinit/datavol.c", "akinit/skel.c",
+       "akinit/gestalt.c", "akinit/bootlog.c", "akinit/run.c", "akinit/inject.c"]
+libmini = ["akinit/libmini/mini.c", "akinit/libmini/start.S"]
+out = "sbin/launchd"
+
+# Everything else, built against the iOS SDK. kind: program, dylib (inject = the programs the kernel starts with it),
+# bundle; plist: the bundle's Info.plist beside the binary; entitlements: signed with them.
+[[build]]
+out = "akita/lib/libakios.backboardd.dylib"
+kind = "dylib"
+src = ["src/inject/backboardd.c"]
+frameworks = ["CoreFoundation", "IOKit"]
+libs = ["objc"]
+inject = ["backboardd"]
+
+[[build]]
+out = "akita/lib/libakios.lockdownd.dylib"
+kind = "dylib"
+src = ["src/inject/lockdownd.c"]
+frameworks = ["CoreFoundation", "MobileActivation"]
+flags = ["-F@sdk/System/Library/PrivateFrameworks"]
+inject = ["lockdownd"]
+
+[[build]]
+out = "akita/lib/libakios.akd.dylib"
+kind = "dylib"
+src = ["src/inject/akd.c"]
+frameworks = ["Foundation", "CoreFoundation"]
+libs = ["objc"]
+inject = ["akd"]
+
+[[build]]
+out = "akita/lib/libakios.bluetoothd.dylib"
+kind = "dylib"
+src = ["src/inject/bluetoothd.c"]
+inject = ["BlueTool", "bluetoothd"]
+
+# os_log lines on the console: in the programs named here, and with log_all=1 in every program ([boot] log_all_skip)
+[[build]]
+out = "akita/lib/libakios.log.dylib"
+kind = "dylib"
+src = ["src/inject/log.c"]
+frameworks = ["CoreFoundation"]
+libs = ["objc"]
+inject = ["backboardd"]
+log_all = true
+
+# the audio server's output device (CoreAudio HAL plug-in); hal/ links to it
+[[build]]
+out = "akita/lib/HakiosAudio.driver/HakiosAudio"
+kind = "bundle"
+src = ["src/audio/audio_plugin.c"]
+frameworks = ["CoreFoundation"]
+plist = "src/audio/Info.plist"
+
+# Metal's plug-in for CoreAnimation over the Mali back end: still built from the old tree (its own repository later);
+# the kernel's boot-arg metal_plugin= names it
+[[build]]
+out = "akita/lib/HakiosMetal.bundle/HakiosMetal"
+kind = "bundle"
+src = ["@metal_plugin/HakiosMetalCA.m"]
+frameworks = ["Foundation", "IOKit", "IOSurface", "Metal"]
+libs = ["objc", "c++", "z"]
+flags = ["-DHAKIOS_METAL_GPU", "-I@metal/include", "@metal/out/ios-mali-arm64e/libhakios-metal.a",
+         "-Wl,-U,_native_bridge_metal_open", "-Wl,-U,_native_bridge_metal_first_problem",
+         "-Wl,-U,_native_bridge_metal_status", "-Wl,-U,_native_bridge_metal_formats",
+         "-Wl,-U,_native_bridge_metal_variant_hook"]
+plist = "@metal_plugin/HakiosMetal.plist"
+make = ["make", "-C", "@metal", "ios-mali", "ARCH=arm64e", "HAKIOS=@legacy"]
+
+# the daemons of ours (jobs/com.akios.*.plist start them)
+[[build]]
+out = "akita/bin/klogsave"
+src = ["src/tools/klogsave.c"]
+
+[[build]]
+out = "akita/bin/memsay"
+src = ["src/tools/memsay.c"]
+
+[[build]]
+out = "akita/bin/thermal_state"
+src = ["src/tools/thermal_state.c"]
+
+[[build]]
+out = "akita/bin/ptp_responder"
+src = ["src/tools/ptp_responder.c"]
+
+[[build]]
+out = "akita/bin/serial_console"
+src = ["src/tools/serial_console.c"]
+
+[[build]]
+out = "akita/bin/healthcheck"
+src = ["src/tools/healthcheck.c"]
+frameworks = ["CoreFoundation", "IOKit"]
+
+[[build]]
+out = "akita/bin/net_test"
+src = ["src/tools/net_test.m"]
+flags = ["-fobjc-arc"]
+frameworks = ["Foundation", "SystemConfiguration"]
+
+[[build]]
+out = "akita/bin/locfeed"
+src = ["src/tools/locfeed.m"]
+flags = ["-fobjc-arc"]
+frameworks = ["Foundation", "CoreLocation"]
+entitlements = "src/tools/locfeed.entitlements"
+
+[[build]]
+out = "akita/bin/lsreg"
+src = ["src/tools/lsreg.m"]
+flags = ["-fobjc-arc"]
+frameworks = ["Foundation", "CoreServices"]
+entitlements = "src/tools/lsreg.entitlements"
+
+# the Metal test application, kept on the owner's word (11-20); com.akios.apps registers it
+[[build]]
+out = "akita/share/system-apps/MetalTest.app/MetalTest"
+src = ["src/MetalTest/main.m"]
+flags = ["-fobjc-arc", "-miphoneos-version-min=14.0"]
+frameworks = ["UIKit", "Metal", "QuartzCore", "Foundation", "CoreGraphics"]
+plist = "src/MetalTest/Info.plist"
+pkginfo = "APPL????"
+entitlements = "src/MetalTest/MetalTest.entitlements"
+
+# data the kernel's boot line names: ca_metallib=/akita/share/ca-share/QuartzCore-default.metallib
+[[share]]
+name = "ca-share"
+from = "@ca_share"
+
+# The firmware (the vendor's files, never in git; @firmware/fw-*): /fw of the image, where the kernel's drivers look
+# ("fw/NAME" of the RAM disk) and which the plan binds onto the system volume's /fw
+[firmware]
+files = [
+  "fw-gpu/mali_csffw-r54p2.bin",
+  "fw-wifi/fw_bcmdhd.bin_4383_a3", "fw-wifi/bcmdhd.cal_4383_a3", "fw-wifi/bcmdhd_clm.blob_4383_a3",
+  "fw-wifi/bcmdhd_txcap.blob_4383_a3", "fw-wifi/BCM.hcd",
+  "fw-haptic/cs40l26*.wmfw", "fw-haptic/cs40l26*.bin",
+  "fw-audio/cs35l41-dsp1-spk-*.wmfw", "fw-audio/cs35l41-dsp1-spk-*.bin", "fw-audio/R-cs35l41-dsp1-spk-*.bin",
+  "fw-aoc/aoc.bin",
+  "fw-camera-akita/camera-akita-*.isp",
+  "fw-modem-akita/nv_normal.bin", "fw-modem-akita/nv_protected.bin", "fw-modem-akita/replay_region.bin",
+  "fw-modem-akita/handover.bin",
+  "fw-gnss/kepler.bin", "fw-gnss/gnss-cfg.bin", "fw-gnss/gnss-start.bin",
+  "fw-sensors/usf-registry.bin",
+]
+# made at build time: the carriers' configuration packed into one file
+carrierconfig = "fw-modem-akita/carrierconfig"
+
+# The data volume's skeleton (/akita/etc/var.skel): the IPSW's template list, then these
+[var]
+files_from = "etc/var"                 # -> /akita/var/..., put on the data volume once (under mobile/: mobile's)
+timezone = "auto"                      # the zone the template's localtime points at ("auto": this machine's)
+retired = ["mobile/Library/Preferences/com.apple.coremedia.plist"]
+dirs = [
+  { path = "/private/var/mobile/tmp",               mode = "700",  uid = 501, gid = 501 },
+  { path = "/private/var/db/hakios-metal-cache",    mode = "1777", uid = 0,   gid = 0 },
+  { path = "/private/var/keybags",                  mode = "700",  uid = 0,   gid = 0 },
+]
+# iOS's usermanagerd aborts at start without a persona manifest; an empty one lets it start (it rewrites it)
+own_files = [
+  { path = "/private/var/keybags/persona.kb", mode = "600", uid = 0, gid = 0, from = "etc/persona.kb" },
+]
+
+[jobs]
+edits = "jobs/edits.toml"
+ours  = "jobs"                         # jobs/com.akios.*.plist, added to Apple's launchd.plist
