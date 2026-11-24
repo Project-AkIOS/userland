@@ -1,0 +1,25 @@
+# The made-up phone of the host test (test/fake.c, FAKE_WORLD): paths that exist; "/a/" a directory.
+/dev/ufs_ios_system
+/dev/ufs_ios_data
+/dev/ufs_ios_preboot
+/dev/ufs_ios_xarts
+/dev/ufs_ios_sysdata
+/dev/ufs_ios_hardware
+/dev/ufs_ios_baseband
+/dev/ufs_ios_update
+/dev/ufs_ios_vm
+/dev/hakios-console
+/flash/private/var/staged_system_apps/MobileMail.app/Info.plist
+/flash/private/var/staged_system_apps/MobileCal.app/Info.plist
+/flash/private/var/staged_system_apps/README
+/private/var/staged_system_apps/MobileMail.app/Info.plist
+/private/var/db/timezone/
+/private/var/MobileAsset/x.plist
+/private/var/tmp/old.txt
+/private/var/tmp/usermanagerd-init.txt
+/private/var/installd/Library/MobileInstallation/LastBuildInfo.plist
+/private/var/mobile/Containers/Data/InternalDaemon/0A1B/Library/Caches/com.apple.LaunchServices-5019.csstore
+/private/var/mobile/Containers/Data/InternalDaemon/0A1B/Library/Caches/other.db
+/private/var/mobile/Containers/Data/InternalDaemon/.hidden/Library/Caches/com.apple.LaunchServices-1.csstore
+/private/var/mobile/Media/hakios-boot/boot-1.log
+/usr/libexec/usermanagerd
