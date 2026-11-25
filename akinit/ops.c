@@ -404,8 +404,8 @@ op_reboot(int argc, char **argv)
 	unsigned int seconds = 10;
 	const char *p;
 
-	if (argc > 0) {
-		for (seconds = 0, p = argv[0]; *p >= '0' && *p <= '9' && seconds < 3600; p++) {
+	if (argc > 1) {                 /* (argv[0] is the step's name) */
+		for (seconds = 0, p = argv[1]; *p >= '0' && *p <= '9' && seconds < 3600; p++) {
 			seconds = seconds * 10 + (unsigned int)(*p - '0');
 		}
 	}
