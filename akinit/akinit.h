@@ -20,6 +20,7 @@
 #define ENOENT          2
 #endif
 #define WNOHANG         1
+#define RB_AUTOBOOT     0x00
 #define RB_HALT         0x08
 
 /* fsutil.c: files and trees */
@@ -71,7 +72,8 @@ int     mount_hfs(const char *dev, const char *at);
 	OP("stderr",      1,  1, op_stderr)       /* stderr PATH: standard error from now on (for what exec starts) */ \
 	OP("env",         1,  1, op_env)          /* env NAME=VALUE: the environment exec gives */ \
 	OP("exec",        1, -1, op_exec)         /* exec PROG ARG...: process 1 becomes PROG */ \
-	OP("halt",        0,  0, op_halt)
+	OP("halt",        0,  0, op_halt)         /* halt: power off (akita: needs a hand to start again) */ \
+	OP("reboot",      0,  1, op_reboot)       /* reboot [SECONDS]: restart after SECONDS (10), RAM and pstore kept */
 
 #define AKINIT_DECLARE(name, lo, hi, fn) int fn(int argc, char **argv);
 AKINIT_OPS(AKINIT_DECLARE)

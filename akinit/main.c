@@ -7,7 +7,7 @@
  * `ak userland` wrote (plan.h has the format, akinit.h the steps): mount the iPhone's system volume from the flash and
  * put our parts over it, make it the root (this image goes to its /private/preboot, and /akita is bound back), mount
  * the data volumes, set what the kernel wants to know, and exec Apple's launchd. If the plan ends without that, the
- * phone halts.
+ * phone restarts (never halts: a halt powers akita off).
  *
  *   akinit --check FILE    (not process 1) parse FILE and say what is wrong with it; status 0 when nothing is
  *   akinit FILE            (not process 1) run FILE: the host test does this against a fake system (test/)
@@ -64,7 +64,7 @@ main(int argc, char **argv, char **envp)
 	}
 	printf("\n=== akinit: the plan ended without starting launchd (%d) ===\n", r);
 	if (getpid() == 1) {
-		op_halt(0, NULL);
+		op_reboot(0, NULL);         /* never a halt: that powers the phone off (see op_reboot) */
 	}
 	return 1;
 }

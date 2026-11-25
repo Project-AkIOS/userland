@@ -93,4 +93,4 @@ env TERM=dumb
 if flag:root-switched exec /sbin/launchd
 end
 say no system volume to start launchd from (root_apfs=)
-halt
+reboot 10

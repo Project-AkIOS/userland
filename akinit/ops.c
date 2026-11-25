@@ -392,6 +392,33 @@ op_exec(int argc, char **argv)
 	return errno;
 }
 
+/*
+ * reboot [SECONDS]: restart the phone after SECONDS (default 10: the console can still be read over USB). A restart,
+ * never a power-off: RAM is kept, so pstore (the boot's log) survives, and the phone comes back by itself -- into
+ * Android, or into the bootloader with restart_fastboot=1. (A halt powers akita off; with the cable in, the bootloader
+ * then goes into charging mode and needs a hand.)
+ */
+int
+op_reboot(int argc, char **argv)
+{
+	unsigned int seconds = 10;
+	const char *p;
+
+	if (argc > 0) {
+		for (seconds = 0, p = argv[0]; *p >= '0' && *p <= '9' && seconds < 3600; p++) {
+			seconds = seconds * 10 + (unsigned int)(*p - '0');
+		}
+	}
+
+	printf("akinit: restarting in %u s\n", seconds);
+	sync();
+	while (seconds-- > 0) {
+		usleep(1000000);
+	}
+	reboot(RB_AUTOBOOT);
+	return errno;
+}
+
 int
 op_halt(int argc, char **argv)
 {
