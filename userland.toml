@@ -87,6 +87,23 @@ src = ["src/audio/audio_plugin.c"]
 frameworks = ["CoreFoundation"]
 plist = "src/audio/Info.plist"
 
+# Metal's plug-in built the AGXMetal way: subclasses of IOGPU.framework's IOGPUMetal* (phase 6; not the default yet)
+[[build]]
+out = "akita/lib/AkiosMetal.bundle/AkiosMetal"
+kind = "bundle"
+src = ["src/metal/AkiosMetal.m"]
+flags = ["-fobjc-arc", "-F@sdk/System/Library/PrivateFrameworks", "-framework", "IOGPU"]
+frameworks = ["Foundation", "IOKit", "Metal"]
+libs = ["objc"]
+plist = "src/metal/Info.plist"
+
+[[build]]
+out = "akita/bin/akios_metal_test"
+src = ["src/tools/akios_metal_test.m"]
+flags = ["-fobjc-arc"]
+frameworks = ["Foundation", "IOKit", "Metal"]
+libs = ["objc"]
+
 # Metal's plug-in for CoreAnimation over the Mali back end: still built from the old tree (its own repository later);
 # the kernel's boot-arg metal_plugin= names it
 [[build]]
