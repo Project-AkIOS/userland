@@ -135,6 +135,12 @@ flags = ["-fobjc-arc"]
 frameworks = ["Foundation", "IOKit", "IOSurface"]
 
 [[build]]
+out = "akita/bin/metal_probe"
+src = ["src/tools/metal_probe.m"]
+flags = ["-fobjc-arc"]
+frameworks = ["Foundation", "Metal", "IOSurface"]
+
+[[build]]
 out = "akita/bin/net_test"
 src = ["src/tools/net_test.m"]
 flags = ["-fobjc-arc"]
