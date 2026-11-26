@@ -14,6 +14,7 @@
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <stdio.h>
+#include <IOSurface/IOSurfaceRef.h>
 
 static void
 dump(const char *what, const void *bytes, size_t size)
@@ -145,6 +146,79 @@ main(int argc, char **argv)
 		printf("4: maxBufferLength %llu MiB, currentAllocatedSize %llu\n",
 		    ((unsigned long long (*)(id, SEL))objc_msgSend)(dev, sel_registerName("maxBufferLength")) >> 20,
 		    ((unsigned long long (*)(id, SEL))objc_msgSend)(dev, sel_registerName("currentAllocatedSize")));
+		/* 5: resources through IOGPU.framework's C API (selector 8, trap 1), then an IOGPUMetalBuffer */
+		{
+			void *(*rcreate)(void *, void *, uint32_t) = dlsym(iogpu, "IOGPUResourceCreate");
+			void *(*rbytes)(void *) = dlsym(iogpu, "IOGPUResourceGetDataBytes");
+			uint64_t (*rgpu)(void *) = dlsym(iogpu, "IOGPUResourceGetGPUVirtualAddress");
+			void *(*rshared)(void *) = dlsym(iogpu, "IOGPUResourceGetClientShared");
+			void (*rrelease)(void *) = dlsym(iogpu, "IOGPUResourceRelease");
+			void *gdev = create(service);
+			static uint8_t mine[3 * 16384] __attribute__((aligned(16384)));
+			IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)@{
+				(id)kIOSurfaceWidth: @256, (id)kIOSurfaceHeight: @64, (id)kIOSurfaceBytesPerElement: @4,
+				(id)kIOSurfacePixelFormat: @((uint32_t)'BGRA') });
+			struct { const char *what; uint32_t kind; uint64_t a38, size; } k[] = {
+				{ "system memory, 64 KiB", 0x00, 0, 0x10000 },
+				{ "the client's memory, 20 KiB", 0x80, (uint64_t)(uintptr_t)mine + 0x100, 0x5000 },
+				{ "an IOSurface 256x64", 0x82, surface ? IOSurfaceGetID(surface) : 0, 0 },
+			};
+
+			if (gdev == NULL || rcreate == NULL || rrelease == NULL) {
+				printf("5: no device or no IOGPUResource functions\n");
+				return 5;
+			}
+			for (unsigned i = 0; i < 3; i++) {
+				uint8_t args[0x58] = { 0 };
+				*(uint32_t *)(args + 0x00) = k[i].kind;
+				*(uint32_t *)(args + 0x08) = 0x10001;
+				*(uint16_t *)(args + 0x0c) = 1;
+				args[0x10] = 1; args[0x11] = 1; args[0x13] = 1;
+				*(uint32_t *)(args + 0x14) = 0x440;             /* zero-fill (and 0x400, always set) */
+				*(uint64_t *)(args + 0x38) = k[i].a38;
+				*(uint64_t *)(args + 0x40) = k[i].kind == 0x80 ? k[i].a38 : 0;
+				*(uint64_t *)(args + 0x48) = k[i].size;
+				void *res = rcreate(gdev, args, sizeof(args));
+				printf("5: %s: %p", k[i].what, res);
+				if (res == NULL) {
+					printf("\n");
+					return 5;
+				}
+				uint8_t *bytes = rbytes(res);
+				printf(", GPU 0x%llx, CPU %p, events %p", rgpu(res), bytes, rshared(res));
+				if (bytes != NULL && k[i].kind == 0) {
+					bytes[0] = 0xa5;
+					bytes[k[i].size - 1] = 0x5a;
+					printf(", writable");
+				}
+				printf("\n");
+				rrelease(res);
+			}
+			if (surface) {
+				CFRelease(surface);
+			}
+			CFRelease(gdev);
+
+			SEL init = sel_registerName("initWithDevice:pointer:length:alignment:options:sysMemSize:gpuAddress:args:argsSize:deallocator:");
+			Method m = class_getInstanceMethod(objc_getClass("IOGPUMetalBuffer"), init);
+			printf("5: IOGPUMetalBuffer init types %s\n", m ? method_getTypeEncoding(m) : "(none)");
+			uint8_t bargs[0x58] = { 0 };
+			id buffer = ((id (*)(id, SEL, id, void *, NSUInteger, NSUInteger, NSUInteger, NSUInteger, uint64_t, void *,
+			    uint64_t, id))objc_msgSend)([objc_getClass("IOGPUMetalBuffer") alloc], init, dev, NULL, 4096, 16, 0, 4096, 0,
+			    bargs, sizeof(bargs), nil);
+			printf("5: IOGPUMetalBuffer: %s\n", buffer ? [[buffer description] UTF8String] : "nil");
+			if (buffer == nil) {
+				return 5;
+			}
+			uint8_t *contents = ((void *(*)(id, SEL))objc_msgSend)(buffer, sel_registerName("contents"));
+			printf("5: contents %p, gpuAddress 0x%llx, length %lu\n", contents,
+			    ((uint64_t (*)(id, SEL))objc_msgSend)(buffer, sel_registerName("gpuAddress")),
+			    (unsigned long)((NSUInteger (*)(id, SEL))objc_msgSend)(buffer, sel_registerName("length")));
+			if (contents) {
+				memset(contents, 0x11, 4096);
+			}
+			buffer = nil;
+		}
 		IOObjectRelease(service);
 		printf("all steps passed\n");
 	}

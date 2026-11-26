@@ -132,7 +132,7 @@ frameworks = ["CoreFoundation", "IOKit"]
 out = "akita/bin/iogpu_test"
 src = ["src/tools/iogpu_test.m"]
 flags = ["-fobjc-arc"]
-frameworks = ["Foundation", "IOKit"]
+frameworks = ["Foundation", "IOKit", "IOSurface"]
 
 [[build]]
 out = "akita/bin/net_test"
