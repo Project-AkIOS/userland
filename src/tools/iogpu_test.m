@@ -15,6 +15,13 @@
 #include <objc/message.h>
 #include <stdio.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <IOKit/IODataQueueClient.h>
+#include <mach/mach.h>
+
+/* (the SDK marks the trap calls unavailable on iOS; IOGPU.framework calls them all the same) */
+extern kern_return_t akios_IOConnectTrap4(io_connect_t, uint32_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t)
+    __asm__("_IOConnectTrap4");
+#define IOConnectTrap4 akios_IOConnectTrap4
 
 static void
 dump(const char *what, const void *bytes, size_t size)
@@ -218,6 +225,114 @@ main(int argc, char **argv)
 				memset(contents, 0x11, 4096);
 			}
 			buffer = nil;
+		}
+		/* 6: a command queue, its notification queue, and submissions by trap 0 (empty, then a stream the GPU runs) */
+		{
+			io_connect_t c = 0;
+			uint8_t qin[0x408] = { 0 };
+			uint64_t qout[2] = { 0 }, sc[2], one;
+			struct { uint64_t va; uint32_t size, id; } shm[2];
+			struct { uint64_t va; uint32_t id, pad; } nqo = { 0 };
+			size_t size;
+			mach_port_t port;
+
+			strlcpy((char *)qin, "/akita/bin/iogpu_test", 0x400);
+			if (IOServiceOpen(service, mach_task_self(), 1, &c) != KERN_SUCCESS) {
+				return 6;
+			}
+			for (int i = 0; i < 2; i++) {
+				sc[0] = 0x4000; sc[1] = (uint64_t)i;
+				size = sizeof(shm[i]);
+				kr = IOConnectCallMethod(c, 12, sc, 2, NULL, 0, NULL, NULL, &shm[i], &size);
+				if (kr != KERN_SUCCESS) {
+					printf("6: shmem: 0x%x\n", kr);
+					return 6;
+				}
+			}
+			size = sizeof(qout);
+			kr = IOConnectCallStructMethod(c, 6, qin, sizeof(qin), qout, &size);
+			printf("6: selector 6 (command queue): 0x%x, id %llu, trace id %llu\n", kr, qout[0], qout[1]);
+			if (kr != KERN_SUCCESS || qout[0] == 0) {
+				return 6;
+			}
+			sc[0] = 0x100; sc[1] = 0x28;
+			size = sizeof(nqo);
+			kr = IOConnectCallMethod(c, 14, sc, 2, NULL, 0, NULL, NULL, &nqo, &size);
+			printf("6: selector 14 (notification queue): 0x%x, at 0x%llx, id %u\n", kr, nqo.va, nqo.id);
+			if (kr != KERN_SUCCESS || nqo.id == 0) {
+				return 6;
+			}
+			port = IODataQueueAllocateNotificationPort();
+			kr = IOConnectSetNotificationPort(c, 0, port, nqo.id);
+			printf("6: notification port: 0x%x\n", kr);
+			sc[0] = qout[0]; sc[1] = nqo.id;
+			kr = IOConnectCallScalarMethod(c, 24, sc, 2, NULL, NULL);
+			printf("6: selector 24 (queue -> notifications): 0x%x\n", kr);
+			if (kr != KERN_SUCCESS) {
+				return 6;
+			}
+			IODataQueueMemory *nq = (IODataQueueMemory *)(uintptr_t)nqo.va;
+
+			/* the GPU's work: a 64 KiB buffer; its first bytes are the stream, the word at 0x1000 its target */
+			uint8_t rargs[0x58] = { 0 }, rout[0x58] = { 0 };
+			*(uint32_t *)(rargs + 0x08) = 0x10001; *(uint16_t *)(rargs + 0x0c) = 1;
+			rargs[0x10] = 1; rargs[0x11] = 1; rargs[0x13] = 1;
+			*(uint32_t *)(rargs + 0x14) = 0x440;
+			*(uint64_t *)(rargs + 0x48) = 0x10000;
+			size = sizeof(rout);
+			kr = IOConnectCallStructMethod(c, 8, rargs, sizeof(rargs), rout, &size);
+			uint64_t gva = *(uint64_t *)rout;
+			volatile uint64_t *cpu = (volatile uint64_t *)(uintptr_t)*(uint64_t *)(rout + 8);
+			printf("6: the work's buffer: 0x%x, GPU 0x%llx, CPU %p\n", kr, gva, cpu);
+			if (kr != KERN_SUCCESS || cpu == NULL) {
+				return 6;
+			}
+			cpu[0] = 1ULL << 56 | 92ULL << 48 | ((gva + 0x1000) & 0xffffffffffffULL);   /* MOVE48 r92 <- target */
+			cpu[1] = 2ULL << 56 | 94ULL << 48 | 0xcafe;                                  /* MOVE32 r94 <- 0xcafe */
+			cpu[2] = 21ULL << 56 | 94ULL << 48 | 92ULL << 40 | 0x1ULL << 16;             /* STORE_MULTIPLE r94 -> [r92] */
+			((volatile uint32_t *)cpu)[0x1000 / 4] = 0;
+
+			for (int round = 0; round < 2; round++) {
+				uint8_t args[0x40] = { 0 };
+				uint32_t status = 0xffffffff;
+				*(uint32_t *)(args + 0x00) = shm[1].id;
+				*(uint32_t *)(args + 0x04) = shm[0].id;
+				*(uint64_t *)(args + 0x10) = 0x5c4ed000 + round;
+				*(uint64_t *)(args + 0x18) = 0xc0de0000 + round;
+				if (round == 1) {
+					*(uint64_t *)(args + 0x30) = gva;
+					*(uint32_t *)(args + 0x38) = 24;
+				}
+				kr = IOConnectTrap4(c, 0, (uintptr_t)qout[0], round ? 0x40 : 0x30, (uintptr_t)args, (uintptr_t)&status);
+				printf("6: %s submitted: 0x%x (status %u)\n", round ? "the stream" : "an empty buffer", kr, status);
+				if (kr != KERN_SUCCESS) {
+					return 6;
+				}
+				for (int got = 0; got < 2;) {
+					uint8_t entry[0x28];
+					uint32_t esize = sizeof(entry);
+
+					if (!IODataQueueDataAvailable(nq)) {
+						struct { mach_msg_header_t h; uint8_t pad[64]; } msg;
+						kern_return_t mr = mach_msg(&msg.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(msg), port, 2000,
+						    MACH_PORT_NULL);
+						if (mr != KERN_SUCCESS && !IODataQueueDataAvailable(nq)) {
+							printf("6: no notification within 2 s (0x%x)\n", mr);
+							return 6;
+						}
+						continue;
+					}
+					IODataQueueDequeue(nq, entry, &esize);
+					printf("6:   notification: token 0x%llx, %llu ns, status %u\n", *(uint64_t *)entry,
+					    *(uint64_t *)(entry + 0x10) - *(uint64_t *)(entry + 8), *(uint32_t *)(entry + 0x18));
+					got++;
+				}
+			}
+			printf("6: the word the GPU stored: 0x%x (0xcafe expected)\n", ((volatile uint32_t *)cpu)[0x1000 / 4]);
+			if (((volatile uint32_t *)cpu)[0x1000 / 4] != 0xcafe) {
+				return 6;
+			}
+			IOServiceClose(c);
 		}
 		IOObjectRelease(service);
 		printf("all steps passed\n");
