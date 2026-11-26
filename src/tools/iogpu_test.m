@@ -332,6 +332,84 @@ main(int argc, char **argv)
 			if (((volatile uint32_t *)cpu)[0x1000 / 4] != 0xcafe) {
 				return 6;
 			}
+
+			/* 7: a shared event (IOSurface.framework), and a command buffer that waits for it and signals it */
+			Class ec = objc_getClass("IOSurfaceSharedEvent");
+			SEL einit = sel_registerName("initWithOptions:");
+			if (ec == Nil || ![ec instancesRespondToSelector:einit]) {
+				printf("7: no IOSurfaceSharedEvent -initWithOptions:\n");
+				return 7;
+			}
+			id ev = ((id (*)(id, SEL, uint64_t))objc_msgSend)([ec alloc], einit, 0);
+			printf("7: shared event: %s\n", ev ? "made" : "nil");
+			if (ev == nil) {
+				return 7;
+			}
+			uint64_t (*getv)(id, SEL) = (uint64_t (*)(id, SEL))objc_msgSend;
+			void (*setv)(id, SEL, uint64_t) = (void (*)(id, SEL, uint64_t))objc_msgSend;
+			BOOL (*waitv)(id, SEL, uint64_t, uint64_t) = (BOOL (*)(id, SEL, uint64_t, uint64_t))objc_msgSend;
+			setv(ev, sel_registerName("setSignaledValue:"), 5);
+			printf("7: set 5, reads %llu\n", getv(ev, sel_registerName("signaledValue")));
+			printf("7: wait for 5: %d; wait for 6 (100 ms): %d (0 expected)\n",
+			    waitv(ev, sel_registerName("waitUntilSignaledValue:timeoutMS:"), 5, 100),
+			    waitv(ev, sel_registerName("waitUntilSignaledValue:timeoutMS:"), 6, 100));
+			uint32_t eport = (uint32_t)((mach_port_t (*)(id, SEL))objc_msgSend)(ev, sel_registerName("eventPort"));
+			printf("7: its port 0x%x\n", eport);
+
+			/* the kernel commands: wait for 10, then (after the GPU) signal 20; the segment list names them */
+			uint8_t *kc = (uint8_t *)(uintptr_t)shm[1].va, *sl = (uint8_t *)(uintptr_t)shm[0].va;
+			uint32_t kcw[12] = { 4, 0x18, eport, 0xffffffff, 10, 0, 3, 0x18, eport, 0, 20, 0 };
+			memcpy(kc, kcw, sizeof(kcw));
+			uint32_t slw[6] = { 0, 0, 1, 0xc0000001, 0, 0x30 };
+			memcpy(sl, slw, sizeof(slw));
+			cpu[0] = 1ULL << 56 | 92ULL << 48 | ((gva + 0x1000) & 0xffffffffffffULL);
+			cpu[1] = 2ULL << 56 | 94ULL << 48 | 0xbeef;
+			((volatile uint32_t *)cpu)[0x1000 / 4] = 0;
+			{
+				uint8_t args[0x40] = { 0 };
+				uint32_t status = 0;
+				int got = 0;
+				*(uint32_t *)(args + 0x00) = shm[1].id;
+				*(uint32_t *)(args + 0x04) = shm[0].id;
+				*(uint64_t *)(args + 0x10) = 0x5c4ed007;
+				*(uint64_t *)(args + 0x18) = 0xc0de0007;
+				*(uint64_t *)(args + 0x30) = gva;
+				*(uint32_t *)(args + 0x38) = 24;
+				kr = IOConnectTrap4(c, 0, (uintptr_t)qout[0], 0x40, (uintptr_t)args, (uintptr_t)&status);
+				printf("7: waiting buffer submitted: 0x%x\n", kr);
+				usleep(300000);
+				while (IODataQueueDataAvailable(nq)) {
+					uint8_t entry[0x28]; uint32_t esize = sizeof(entry);
+					IODataQueueDequeue(nq, entry, &esize);
+					printf("7:   before the signal: token 0x%llx\n", *(uint64_t *)entry);
+					got++;
+				}
+				printf("7: after 300 ms the word is 0x%x (0 expected: held back)\n", ((volatile uint32_t *)cpu)[0x1000 / 4]);
+				if (((volatile uint32_t *)cpu)[0x1000 / 4] != 0) {
+					return 7;
+				}
+				setv(ev, sel_registerName("setSignaledValue:"), 10);
+				while (got < 2) {
+					uint8_t entry[0x28]; uint32_t esize = sizeof(entry);
+					if (!IODataQueueDataAvailable(nq)) {
+						struct { mach_msg_header_t h; uint8_t pad[64]; } msg;
+						if (mach_msg(&msg.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(msg), port, 2000, MACH_PORT_NULL) !=
+						    KERN_SUCCESS && !IODataQueueDataAvailable(nq)) {
+							printf("7: no completion within 2 s of the signal\n");
+							return 7;
+						}
+						continue;
+					}
+					IODataQueueDequeue(nq, entry, &esize);
+					printf("7:   notification: token 0x%llx, status %u\n", *(uint64_t *)entry, *(uint32_t *)(entry + 0x18));
+					got++;
+				}
+				printf("7: the word is 0x%x (0xbeef expected), the event %llu (20 expected)\n",
+				    ((volatile uint32_t *)cpu)[0x1000 / 4], getv(ev, sel_registerName("signaledValue")));
+				if (((volatile uint32_t *)cpu)[0x1000 / 4] != 0xbeef || getv(ev, sel_registerName("signaledValue")) != 20) {
+					return 7;
+				}
+			}
 			IOServiceClose(c);
 		}
 		IOObjectRelease(service);
