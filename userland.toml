@@ -129,6 +129,12 @@ src = ["src/tools/healthcheck.c"]
 frameworks = ["CoreFoundation", "IOKit"]
 
 [[build]]
+out = "akita/bin/iogpu_test"
+src = ["src/tools/iogpu_test.m"]
+flags = ["-fobjc-arc"]
+frameworks = ["Foundation", "IOKit"]
+
+[[build]]
 out = "akita/bin/net_test"
 src = ["src/tools/net_test.m"]
 flags = ["-fobjc-arc"]
