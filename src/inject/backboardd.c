@@ -1595,6 +1595,14 @@ extern kern_return_t akios_IORegistryEntrySetCFProperties(io_registry_entry_t, C
 /* boot-arg hid_buttons=1: the buttons are the kernel's IOHIDEventService (AkitaButtons), not a service made here */
 static bool kernel_buttons;
 
+/*
+ * boot-arg hid_touch=1: the touch screen is the kernel's IOHIDEventService (AkitaTouchScreen), which makes the same
+ * events as send_touch() from the same samples and does tap-to-wake itself. No touch screen service here then, and
+ * no touch sample read from /dev/hakios-touch is sent on; the HID client is still made, for the buttons (without
+ * hid_buttons=1) and the sensor services.
+ */
+static bool kernel_touch;
+
 /* a press of the lock button (Consumer 0x30, down then up) through the kernel's buttons service: its AkitaPressButton */
 static void
 kernel_press_lock(void)
@@ -1668,6 +1676,7 @@ input_thread(__unused void *arg)
 	static const int types[] = { HID_CLIENT_SIMPLE, HID_CLIENT_RATE_CONTROLLED };
 	IOHIDEventSystemClientRef client = NULL;
 	IOHIDServiceClientRef screen = NULL, buttons = NULL;
+	bool have_client = false;       /* a client that may make services: the screen's, or (hid_touch=1) the first */
 	struct hakios_touch t;
 	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
 	int device;
@@ -1680,6 +1689,7 @@ input_thread(__unused void *arg)
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 			touch_latency = strstr(arguments, "touch_lat=1") != NULL;
 			kernel_buttons = strstr(arguments, "hid_buttons=1") != NULL;
+			kernel_touch = strstr(arguments, "hid_touch=1") != NULL;
 		}
 		mach_timebase_info(&timebase);
 	}
@@ -1689,7 +1699,7 @@ input_thread(__unused void *arg)
 		return NULL;
 	}
 	sleep(3);                       /* let backboardd get as far as starting its event server */
-	for (unsigned i = 0; screen == NULL && i < sizeof(types) / sizeof(types[0]); i++) {
+	for (unsigned i = 0; screen == NULL && !have_client && i < sizeof(types) / sizeof(types[0]); i++) {
 		/* this waits until the server (this very program) answers */
 		client = IOHIDEventSystemClientCreateWithType(NULL, types[i], NULL);
 		if (client == NULL) {
@@ -1697,12 +1707,17 @@ input_thread(__unused void *arg)
 			continue;
 		}
 		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("akita.input", NULL));
+		if (kernel_touch) {
+			have_client = true;     /* (the first type, which has always been able to make services) */
+			break;
+		}
 		screen = make_service(client, "HakiOS touch screen", HID_PAGE_DIGITIZER, HID_USAGE_TOUCH_SCREEN, true);
 		if (screen == NULL) {
 			say("hakios: input: a HID client of type %d may not create services\n", types[i]);
 		}
 	}
-	if (screen != NULL && !kernel_buttons) {
+	have_client |= screen != NULL;
+	if (have_client && !kernel_buttons) {
 		/*
 		 * (Not with boot-arg hid_buttons=1: the kernel's own buttons service, AkitaButtons, is the built-in 0x0b/0x01
 		 * one then, and backboardd's event system reads it as an iPhone's.)
@@ -1715,12 +1730,13 @@ input_thread(__unused void *arg)
 		buttons = make_service2(client, "HakiOS buttons", HID_PAGE_TELEPHONY, HID_USAGE_TELEPHONY_PHONE, HID_PAGE_CONSUMER,
 		    HID_USAGE_CONSUMER_CONTROL, false);
 	}
-	if (screen != NULL) {
+	if (have_client) {
 		sensor_services(client);
 	}
-	say("hakios: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
+	say("hakios: input: touch screen service %p%s, buttons %p\n", (void *)screen,
+	    kernel_touch ? " (hid_touch=1: the kernel's AkitaTouchScreen)" : "", (void *)buttons);
 	dispatch_semaphore_signal(input_services_made); /* see wait_for_als_arrival() */
-	if (screen == NULL) {
+	if (!have_client) {
 		return NULL;
 	}
 
@@ -1734,6 +1750,8 @@ input_thread(__unused void *arg)
 			if (buttons != NULL) {
 				send_button(buttons, &t);
 			}
+		} else if (kernel_touch) {
+			/* (hid_touch=1: AkitaTouchScreen has this sample already, and does tap-to-wake itself) */
 		} else if (t.type == HAKIOS_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && kernel_buttons) {
 			/* the display is off and a tap is to wake it: the lock button, pressed by the kernel's buttons service */
 			kernel_press_lock();
@@ -1765,12 +1783,173 @@ input_thread(__unused void *arg)
 	return NULL;
 }
 
+/*
+ * Boot-arg hid_monitor=1 (diagnostics, 11-26): every digitizer event the event system passes on, as an event system
+ * monitor client sees it -- to compare the kernel's AkitaTouchScreen (hid_touch=1) with the virtual touch screen
+ * here, field by field and byte by byte. Per event (the parent, then each child) one line
+ *   hid_monitor: #seq.child t=TIME (+AGE us) snd=SENDER fl=FLAGS ty=TRANSDUCER ix= id= em= cem= bm= r/t/di/bi
+ *                x= y= z= p= q= dn= ir= ma= mi= ac= g= wu= du= ot= ch=CHILDREN
+ * (AGE: how long before the moment the monitor had it the event was stamped, in mach absolute time); and for the
+ * parent its bytes as IOHIDEventCreateData serializes them, "hid_monitor: raw #seq OFFSET: HEX", 64 bytes a line.
+ */
+extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreateWithType(CFAllocatorRef allocator, int type, CFDictionaryRef attributes);
+typedef void (*hid_monitor_callback)(void *target, void *refcon, void *sender, IOHIDEventRef event);
+extern void IOHIDEventSystemClientRegisterEventCallback(IOHIDEventSystemClientRef client, hid_monitor_callback callback,
+    void *target, void *refcon);
+extern void IOHIDEventSystemClientActivate(IOHIDEventSystemClientRef client);
+extern uint32_t IOHIDEventGetType(IOHIDEventRef event);
+extern uint64_t IOHIDEventGetTimeStamp(IOHIDEventRef event);
+extern uint64_t IOHIDEventGetSenderID(IOHIDEventRef event);
+extern uint32_t IOHIDEventGetEventFlags(IOHIDEventRef event);
+extern CFIndex IOHIDEventGetIntegerValue(IOHIDEventRef event, uint32_t field);
+extern double IOHIDEventGetDoubleValue(IOHIDEventRef event, uint32_t field);
+extern CFArrayRef IOHIDEventGetChildren(IOHIDEventRef event);
+extern CFDataRef IOHIDEventCreateData(CFAllocatorRef allocator, IOHIDEventRef event);
+
+static unsigned hid_monitor_seq;
+
+static void
+hid_monitor_line(IOHIDEventRef e, unsigned seq, int child, uint64_t now)
+{
+#define DF(n) (0xb0000 | (n))
+	CFArrayRef children = IOHIDEventGetChildren(e);
+	uint64_t ts = IOHIDEventGetTimeStamp(e);
+	uint64_t age = now > ts ? micros(now - ts) : 0;
+
+	say("hid_monitor: #%u.%d t=%llu (+%lluus) snd=%#llx fl=%#x ty=%ld ix=%ld id=%ld em=%#lx cem=%#lx bm=%#lx "
+	    "r%ld t%ld di%ld bi%ld ch=%ld\n", seq, child, ts, age, IOHIDEventGetSenderID(e), IOHIDEventGetEventFlags(e),
+	    IOHIDEventGetIntegerValue(e, DF(4)), IOHIDEventGetIntegerValue(e, DF(5)), IOHIDEventGetIntegerValue(e, DF(6)),
+	    IOHIDEventGetIntegerValue(e, DF(7)), IOHIDEventGetIntegerValue(e, DF(24)), IOHIDEventGetIntegerValue(e, DF(3)),
+	    IOHIDEventGetIntegerValue(e, DF(8)), IOHIDEventGetIntegerValue(e, DF(9)), IOHIDEventGetIntegerValue(e, DF(25)),
+	    IOHIDEventGetIntegerValue(e, 4), children ? CFArrayGetCount(children) : 0L);
+	say("hid_monitor: #%u.%d x=%.5f y=%.5f z=%.3f p=%.3f ap=%.3f tw=%.3f q=%.3f dn=%.3f ir=%.3f ma=%.3f mi=%.3f "
+	    "ac=%.3f ot=%ld g=%ld wu=%#lx du=%#lx col=%ld\n", seq, child,
+	    IOHIDEventGetDoubleValue(e, DF(0)), IOHIDEventGetDoubleValue(e, DF(1)), IOHIDEventGetDoubleValue(e, DF(2)),
+	    IOHIDEventGetDoubleValue(e, DF(10)), IOHIDEventGetDoubleValue(e, DF(11)), IOHIDEventGetDoubleValue(e, DF(12)),
+	    IOHIDEventGetDoubleValue(e, DF(17)), IOHIDEventGetDoubleValue(e, DF(18)), IOHIDEventGetDoubleValue(e, DF(19)),
+	    IOHIDEventGetDoubleValue(e, DF(20)), IOHIDEventGetDoubleValue(e, DF(21)), IOHIDEventGetDoubleValue(e, DF(26)),
+	    IOHIDEventGetIntegerValue(e, DF(31)), IOHIDEventGetIntegerValue(e, DF(27)), IOHIDEventGetIntegerValue(e, DF(28)),
+	    IOHIDEventGetIntegerValue(e, DF(29)), IOHIDEventGetIntegerValue(e, DF(22)));
+#undef DF
+}
+
+static void
+hid_monitor_event(__unused void *target, __unused void *refcon, __unused void *sender, IOHIDEventRef event)
+{
+	uint64_t now = mach_absolute_time();
+	unsigned seq;
+	CFArrayRef children;
+	CFDataRef data;
+
+	if (event == NULL || IOHIDEventGetType(event) != 11 /* kIOHIDEventTypeDigitizer */) {
+		return;
+	}
+	seq = hid_monitor_seq++;
+	hid_monitor_line(event, seq, -1, now);
+	children = IOHIDEventGetChildren(event);
+	for (CFIndex i = 0; children != NULL && i < CFArrayGetCount(children); i++) {
+		hid_monitor_line((IOHIDEventRef)CFArrayGetValueAtIndex(children, i), seq, (int)i, now);
+	}
+	data = IOHIDEventCreateData(NULL, event);
+	if (data != NULL) {
+		const uint8_t *bytes = CFDataGetBytePtr(data);
+		CFIndex length = CFDataGetLength(data);
+
+		for (CFIndex off = 0; off < length; off += 64) {
+			char hex[64 * 2 + 1];
+			CFIndex n = length - off < 64 ? length - off : 64;
+
+			for (CFIndex i = 0; i < n; i++) {
+				snprintf(hex + 2 * i, 3, "%02x", bytes[off + i]);
+			}
+			say("hid_monitor: raw #%u %03lx: %s\n", seq, (long)off, hex);
+		}
+		CFRelease(data);
+	}
+}
+
+static void *
+hid_monitor_thread(__unused void *unused)
+{
+	static const int types[] = { 1 /* monitor */, 0 /* admin */, 2 /* passive */ };
+	IOHIDEventSystemClientRef client = NULL;
+
+	pthread_setname_np("akita hid_monitor");
+	mach_timebase_info(&timebase);  /* (micros(); input_thread sets it too) */
+	sleep(4);                       /* (after the event server is up, as input_thread waits too) */
+	for (unsigned i = 0; client == NULL && i < sizeof(types) / sizeof(types[0]); i++) {
+		client = IOHIDEventSystemClientCreateWithType(NULL, types[i], NULL);
+		say("hid_monitor: client of type %d: %p\n", types[i], (void *)client);
+	}
+	if (client == NULL) {
+		return NULL;
+	}
+	IOHIDEventSystemClientRegisterEventCallback(client, hid_monitor_event, NULL, NULL);
+	IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("akita.hid_monitor", NULL));
+	IOHIDEventSystemClientActivate(client);
+	say("hid_monitor: watching digitizer events\n");
+	return NULL;
+}
+
+/*
+ * (hid_monitor=1) Which digitizers backboardd's touch processing has taken, at 20, 45 and 90 s: the main display,
+ * AOP and pencil digitizer services of the BKHIDDirectTouchEventProcessor (nil = none taken). The injection's virtual
+ * screen and the kernel's AkitaTouchScreen describe themselves there with their sender IDs.
+ */
+static void
+hid_monitor_digitizers(void)
+{
+	Class registry_class = objc_getClass("BKHIDEventProcessorRegistry"), processor_class =
+	    objc_getClass("BKHIDDirectTouchEventProcessor");
+	static const char *const getters[] = { "mainDisplayDigitizerService", "mainDisplayAOPDigitizerService",
+		                               "mainDisplayPencilDigitizerService" };
+	id registry, processor;
+
+	if (registry_class == NULL || processor_class == NULL) {
+		say("hid_monitor: digitizers: no %s\n", registry_class == NULL ? "BKHIDEventProcessorRegistry" :
+		    "BKHIDDirectTouchEventProcessor");
+		return;
+	}
+	registry = ((id (*)(Class, SEL))objc_msgSend)(registry_class, sel_registerName("sharedInstance"));
+	processor = registry ? ((id (*)(id, SEL, Class))objc_msgSend)(registry, sel_registerName("eventProcessorOfClass:"),
+	    processor_class) : NULL;
+	if (processor == NULL) {
+		say("hid_monitor: digitizers: no touch event processor (registry %p)\n", (void *)registry);
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(getters) / sizeof(getters[0]); i++) {
+		SEL sel = sel_registerName(getters[i]);
+		id service = ((BOOL (*)(id, SEL, SEL))objc_msgSend)(processor, sel_registerName("respondsToSelector:"), sel) ?
+		    ((id (*)(id, SEL))objc_msgSend)(processor, sel) : NULL;
+		id text = service ? ((id (*)(id, SEL))objc_msgSend)(service, sel_registerName("description")) : NULL;
+		const char *utf = text ? ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String")) : "(nil)";
+
+		say("hid_monitor: digitizers: %s: %.200s\n", getters[i], utf);
+	}
+}
+
 static void
 input_start(void)
 {
 	pthread_t thread;
 
 	input_services_made = dispatch_semaphore_create(0);
+	{
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+		pthread_t monitor;
+
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "hid_monitor=1") != NULL &&
+		    pthread_create(&monitor, NULL, hid_monitor_thread, NULL) == 0) {
+			pthread_detach(monitor);
+			for (int at = 0; at < 3; at++) {
+				static const int seconds[] = { 20, 45, 90 };
+
+				dispatch_after(dispatch_time(DISPATCH_TIME_NOW, seconds[at] * NSEC_PER_SEC),
+				    dispatch_get_global_queue(0, 0), ^{ hid_monitor_digitizers(); });
+			}
+		}
+	}
 	if (pthread_create(&thread, NULL, input_thread, NULL) == 0) {
 		pthread_detach(thread);
 	}
