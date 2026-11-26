@@ -109,7 +109,7 @@ flags = ["-fobjc-arc", "-F@sdk/System/Library/PrivateFrameworks", "-framework", 
 frameworks = ["Foundation", "IOKit", "IOSurface", "Metal"]
 libs = ["objc", "c++", "z"]
 plist = "src/metal/Info.plist"
-make = ["make", "-C", "@metal", "ios-mali", "ARCH=arm64e", "HAKIOS=@legacy"]
+make = ["make", "-C", "@metal", "ios-mali", "ARCH=arm64e"]
 
 # (its kernels and draw functions: the Metal tree's tools/kernels, as metal_kernels_lib.h and mali_draw_bc.h of the old userland)
 [[build]]
@@ -132,7 +132,7 @@ flags = ["-DHAKIOS_METAL_GPU", "-I@metal/include", "@metal/out/ios-mali-arm64e/l
          "-Wl,-U,_native_bridge_metal_status", "-Wl,-U,_native_bridge_metal_formats",
          "-Wl,-U,_native_bridge_metal_variant_hook"]
 plist = "@metal_plugin/HakiosMetal.plist"
-make = ["make", "-C", "@metal", "ios-mali", "ARCH=arm64e", "HAKIOS=@legacy"]
+make = ["make", "-C", "@metal", "ios-mali", "ARCH=arm64e"]
 
 # the daemons of ours (jobs/com.akios.*.plist start them)
 [[build]]
