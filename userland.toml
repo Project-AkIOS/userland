@@ -63,6 +63,14 @@ frameworks = ["Foundation", "CoreFoundation"]
 libs = ["objc"]
 inject = ["akd"]
 
+# a bring-up aid, off unless skip_setup=1: SpringBoard skips the setup assistant (src/inject/springboard.c)
+[[build]]
+out = "akita/lib/libakios.springboard.dylib"
+kind = "dylib"
+src = ["src/inject/springboard.c"]
+libs = ["objc"]
+inject = ["SpringBoard"]
+
 [[build]]
 out = "akita/lib/libakios.bluetoothd.dylib"
 kind = "dylib"
