@@ -1532,6 +1532,56 @@ akm_trace_draw(const void *which, const char *program, const struct hakios_metal
  * tessellation factor buffers, counter sampling and the object/mesh setters are declared by <MTLRenderCommandEncoder>
  * and refused through -forwardInvocation: (or Metal's own abstract bodies) above, by name */
 
+/* Tile shading, tessellation and the depth test's bounds are not served: refused by name, and the draws that follow
+ * fail by it (the earlier plug-in refused them through its forwarding) */
+- (void)akRefuseState:(const char *)what
+{
+	akios_say("refused: %s on a render encoder (not served)\n", what);
+	if (_refused[0] == '\0') {
+		snprintf(_refused, sizeof(_refused), "%s (not served)", what);
+	}
+}
+- (void)dispatchThreadsPerTile:(MTLSize)threads { (void)threads; [self akRefuseState:"a tile dispatch"]; }
+- (void)setTileBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { (void)b; (void)o; (void)i; [self akRefuseState:"a tile buffer"]; }
+- (void)setTileBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { (void)o; (void)i; [self akRefuseState:"a tile buffer"]; }
+- (void)setTileBuffers:(const id<MTLBuffer> __unsafe_unretained *)b offsets:(const NSUInteger *)o withRange:(NSRange)r
+{
+	(void)b; (void)o; (void)r;
+	[self akRefuseState:"tile buffers"];
+}
+- (void)setTileBytes:(const void *)b length:(NSUInteger)l atIndex:(NSUInteger)i { (void)b; (void)l; (void)i; [self akRefuseState:"tile bytes"]; }
+- (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { (void)t; (void)i; [self akRefuseState:"a tile texture"]; }
+- (void)setTileTextures:(const id<MTLTexture> __unsafe_unretained *)t withRange:(NSRange)r { (void)t; (void)r; [self akRefuseState:"tile textures"]; }
+- (void)setTileSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { (void)s; (void)i; [self akRefuseState:"a tile sampler"]; }
+- (void)setTileSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i
+{
+	(void)s; (void)a; (void)b; (void)i;
+	[self akRefuseState:"a tile sampler"];
+}
+- (void)setTileSamplerStates:(const id<MTLSamplerState> __unsafe_unretained *)s withRange:(NSRange)r { (void)s; (void)r; [self akRefuseState:"tile samplers"]; }
+- (void)setTileSamplerStates:(const id<MTLSamplerState> __unsafe_unretained *)s lodMinClamps:(const float *)a lodMaxClamps:(const float *)b
+    withRange:(NSRange)r
+{
+	(void)s; (void)a; (void)b; (void)r;
+	[self akRefuseState:"tile samplers"];
+}
+- (void)setThreadgroupMemoryLength:(NSUInteger)l offset:(NSUInteger)o atIndex:(NSUInteger)i
+{
+	(void)l; (void)o; (void)i;
+	[self akRefuseState:"tile threadgroup memory"];
+}
+- (void)setTessellationFactorBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o instanceStride:(NSUInteger)s
+{
+	(void)b; (void)o; (void)s;
+	[self akRefuseState:"a tessellation factor buffer"];
+}
+- (void)setTessellationFactorScale:(float)scale { (void)scale; [self akRefuseState:"a tessellation factor scale"]; }
+- (void)setDepthTestMinBound:(float)minBound maxBound:(float)maxBound
+{
+	(void)minBound; (void)maxBound;
+	[self akRefuseState:"depth test bounds"];
+}
+
 - (void)endEncoding
 {
 	/* a Clear no draw spent: the pass still owes it (a pass that only clears is how many clients wipe a drawable) */
@@ -1623,6 +1673,9 @@ akm_trace_draw(const void *which, const char *program, const struct hakios_metal
 	return [[AkiosMaliRenderEncoder alloc] initWithAkiosCommandBuffer:_akCommandBuffer pass:&pass colorTexture:_colorTexture
 										  sub:sub];
 }
+
+/* (one queue runs everything in order, caches flushed between jobs: a barrier between queue stages orders nothing more) */
+- (void)barrierAfterQueueStages:(MTLStages)after beforeStages:(MTLStages)before { (void)after; (void)before; }
 
 /* every sub-encoder stores (above); a resolve asked for here is read from the descriptor's store action at the end */
 - (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index

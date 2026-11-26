@@ -51,6 +51,7 @@
 - (NSUInteger)size { return [_descriptor size]; }
 - (NSUInteger)usedSize { return _used; }
 - (NSUInteger)currentAllocatedSize { return [_descriptor size]; }
+- (NSUInteger)allocatedSize { return [_descriptor size]; }
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment
 {
 	(void)alignment;

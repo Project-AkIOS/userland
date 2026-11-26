@@ -122,6 +122,10 @@ akios_layered(unsigned type)
 	hakios_metal_texture_free(_akCore);   /* (a command buffer that uses it holds the wrapper until it has completed) */
 }
 
+/* (sparse textures are not served: no tail) */
+- (NSUInteger)firstMipmapInTail { return [self mipmapLevelCount]; }
+- (NSUInteger)tailSizeInBytes { return 0; }
+
 /* what an argument buffer holds for the texture (the core's id, found again by a dispatch reading it) */
 - (MTLResourceID)gpuResourceID
 {
@@ -322,6 +326,42 @@ akios_layered(unsigned type)
 	    (unsigned)descriptor.height, (unsigned)usage, [texture gpuAddress], cpu, (uint64_t)rows * height, (uint32_t)rows);
 	if (t == NULL) {
 		akios_say("refused: a texture over IOSurface %u plane %lu: %s\n", IOSurfaceGetID(surface), (unsigned long)plane, hakios_metal_error());
+		return nil;
+	}
+	[texture akSetCore:t];
+	[texture akSetUsage:usage];
+	return (id<MTLTexture>)texture;
+}
+
+@end
+
+/* -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: IOGPU's texture over the buffer's resource, the core's over
+ * the same rows (2D, one level; start and pitch 64-byte multiples, as the device's alignment queries say) */
+@implementation AkiosMaliBuffer (Textures)
+
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bytesPerRow
+{
+	hakios_metal_buffer *core = [self akCore];
+
+	if (core == NULL || descriptor == nil) {
+		akios_say("refused: a texture over a buffer: %s\n", core == NULL ? "a buffer without the core's wrapper" : "no descriptor");
+		return nil;
+	}
+	MTLTextureUsage usage = descriptor.usage & ~(MTLTextureUsage)MTLTextureUsagePixelFormatView & (MTLTextureUsage)0xffff;
+	if (usage == MTLTextureUsageUnknown) {
+		usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+	}
+	hakios_metal_texture *t = hakios_metal_texture_new_buffer(core, (unsigned)descriptor.textureType, (unsigned)descriptor.pixelFormat,
+	    (unsigned)descriptor.width, (unsigned)descriptor.height, (unsigned)usage, offset, bytesPerRow);
+	if (t == NULL) {
+		akios_say("refused: a texture of %lux%lu, pixel format %lu over a buffer at %lu, rows %lu: %s\n", (unsigned long)descriptor.width,
+		    (unsigned long)descriptor.height, (unsigned long)descriptor.pixelFormat, (unsigned long)offset, (unsigned long)bytesPerRow,
+		    hakios_metal_error());
+		return nil;
+	}
+	AkiosMaliTexture *texture = [[AkiosMaliTexture alloc] initWithBuffer:self descriptor:descriptor offset:offset bytesPerRow:bytesPerRow];
+	if (texture == nil) {
+		hakios_metal_texture_free(t);
 		return nil;
 	}
 	[texture akSetCore:t];

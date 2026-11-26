@@ -45,6 +45,8 @@ extern io_connect_t IOGPUDeviceGetConnect(void *device);
     plane:(NSUInteger)plane field:(NSUInteger)field args:(void *)args argsSize:(NSUInteger)argsSize;
 - (instancetype)initWithTexture:(id)texture pixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type
     levels:(NSRange)levels slices:(NSRange)slices;
+- (instancetype)initWithBuffer:(id)buffer descriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset
+    bytesPerRow:(NSUInteger)bytesPerRow;
 - (instancetype)initWithTexture:(id)texture pixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type
     levels:(NSRange)levels slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swizzle;
 /* (IOGPU's answers, from the descriptor) */
@@ -54,6 +56,7 @@ extern io_connect_t IOGPUDeviceGetConnect(void *device);
 - (NSUInteger)sampleCount;
 - (NSUInteger)arrayLength;
 - (NSUInteger)mipmapLevelCount;
+- (NSUInteger)bufferBytesPerRow;
 - (MTLPixelFormat)pixelFormat;
 - (MTLTextureType)textureType;
 - (MTLTextureUsage)usage;

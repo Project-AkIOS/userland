@@ -108,6 +108,26 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 	return 64;
 }
 
+/* the rest of <MTLDevice> neither IOGPUMetalDevice nor _MTLDevice answers (a protocol-wide diff of the 27.2 SDK
+ * against their method lists, 11-26): an internal GPU, never removed, no sparse textures, threadgroup memory as the
+ * core's front end lays it (32 KiB) */
+- (BOOL)isLowPower { return NO; }
+- (BOOL)isHeadless { return NO; }
+- (BOOL)isRemovable { return NO; }
+- (BOOL)isDepth24Stencil8PixelFormatSupported { return NO; }
+- (NSUInteger)maxThreadgroupMemoryLength { return 32768; }
+- (MTLSize)sparseTileSizeWithTextureType:(MTLTextureType)type pixelFormat:(MTLPixelFormat)format sampleCount:(NSUInteger)samples
+{
+	(void)type; (void)format; (void)samples;
+	return MTLSizeMake(0, 0, 0);
+}
+- (MTLSize)sparseTileSizeWithTextureType:(MTLTextureType)type pixelFormat:(MTLPixelFormat)format sampleCount:(NSUInteger)samples
+    sparsePageSize:(MTLSparsePageSize)size
+{
+	(void)type; (void)format; (void)samples; (void)size;
+	return MTLSizeMake(0, 0, 0);
+}
+
 /* _MTLDevice's own answer is a NULL its caller dereferences: a real struct, named after the GPU (Metal then looks for a
  * pipelines.Mali-G715 library, finds none, and carries on) */
 - (const struct MTLTargetDeviceArch *)targetDeviceInfo

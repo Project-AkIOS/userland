@@ -654,6 +654,23 @@ akm_arguments_of(hakios_metal_program *program, unsigned stage)
 		 (unsigned long)index);
 	return nil;
 }
+
+/* argument buffer members of kinds the front end's layout has no slot for: said once, nothing written */
+#define AKM_ARGENC_REFUSE(what) AK_ONCE("refused: an argument encoder's %s (not served); nothing is written\n", what)
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)s atIndex:(NSUInteger)i { (void)s; (void)i; AKM_ARGENC_REFUSE("render pipeline"); }
+- (void)setRenderPipelineStates:(const id<MTLRenderPipelineState> __unsafe_unretained *)s withRange:(NSRange)r { (void)s; (void)r; AKM_ARGENC_REFUSE("render pipelines"); }
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)s atIndex:(NSUInteger)i { (void)s; (void)i; AKM_ARGENC_REFUSE("compute pipeline"); }
+- (void)setComputePipelineStates:(const id<MTLComputePipelineState> __unsafe_unretained *)s withRange:(NSRange)r { (void)s; (void)r; AKM_ARGENC_REFUSE("compute pipelines"); }
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)s atIndex:(NSUInteger)i { (void)s; (void)i; AKM_ARGENC_REFUSE("depth/stencil state"); }
+- (void)setDepthStencilStates:(const id<MTLDepthStencilState> __unsafe_unretained *)s withRange:(NSRange)r { (void)s; (void)r; AKM_ARGENC_REFUSE("depth/stencil states"); }
+- (void)setIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)b atIndex:(NSUInteger)i { (void)b; (void)i; AKM_ARGENC_REFUSE("indirect command buffer"); }
+- (void)setIndirectCommandBuffers:(const id<MTLIndirectCommandBuffer> __unsafe_unretained *)b withRange:(NSRange)r { (void)b; (void)r; AKM_ARGENC_REFUSE("indirect command buffers"); }
+- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)a atIndex:(NSUInteger)i { (void)a; (void)i; AKM_ARGENC_REFUSE("acceleration structure"); }
+- (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atIndex:(NSUInteger)i { (void)t; (void)i; AKM_ARGENC_REFUSE("visible function table"); }
+- (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __unsafe_unretained *)t withRange:(NSRange)r { (void)t; (void)r; AKM_ARGENC_REFUSE("visible function tables"); }
+- (void)setIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atIndex:(NSUInteger)i { (void)t; (void)i; AKM_ARGENC_REFUSE("intersection function table"); }
+- (void)setIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)t withRange:(NSRange)r { (void)t; (void)r; AKM_ARGENC_REFUSE("intersection function tables"); }
+
 @end
 
 @implementation AkiosMaliDevice (RenderPipelines)

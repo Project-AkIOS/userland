@@ -437,6 +437,13 @@ akios_memory_free(void *context, void *cookie)
 	return (id<MTLComputeCommandEncoder>)[[AkiosMaliComputeEncoder alloc] initWithAkiosCommandBuffer:self];
 }
 
+/* sparse textures (the resource state encoder's work) are not served */
+- (id<MTLResourceStateCommandEncoder>)resourceStateCommandEncoder
+{
+	AK_ONCE("refused: a resource state encoder (sparse textures are not served); it returns nil\n");
+	return nil;
+}
+
 /* (concurrent dispatch is served as serial: stricter ordering than asked for) */
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type
 {

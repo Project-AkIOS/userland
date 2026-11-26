@@ -354,6 +354,17 @@ akios_layered(unsigned type)
 	hakios_metal_buffer_free(staging);
 }
 
+/* texture access counters belong to sparse textures, which are not served: nothing counted, nothing reset */
+- (void)getTextureAccessCounters:(id<MTLTexture>)texture region:(MTLRegion)region mipLevel:(NSUInteger)mipLevel slice:(NSUInteger)slice
+    resetCounters:(BOOL)reset countersBuffer:(id<MTLBuffer>)buffer countersBufferOffset:(NSUInteger)offset
+{
+	(void)texture; (void)region; (void)mipLevel; (void)slice; (void)reset; (void)buffer; (void)offset;
+}
+- (void)resetTextureAccessCounters:(id<MTLTexture>)texture region:(MTLRegion)region mipLevel:(NSUInteger)mipLevel slice:(NSUInteger)slice
+{
+	(void)texture; (void)region; (void)mipLevel; (void)slice;
+}
+
 - (void)endEncoding
 {
 	[super endEncoding];   /* (the base retained the command buffer in its initialiser and gives it back here) */
@@ -616,6 +627,23 @@ akios_layered(unsigned type)
 	}
 }
 - (void)setThreadgroupPackingDisabled:(BOOL)disabled { (void)disabled; }
+
+/* imageblocks and stage-in regions are not served: refused by name, and the dispatches that follow fail by it */
+- (void)setImageblockWidth:(NSUInteger)width height:(NSUInteger)height
+{
+	[self akRefuse:[NSString stringWithFormat:@"an imageblock of %lux%lu (tile memory is not served)", (unsigned long)width,
+	    (unsigned long)height]];
+}
+- (void)setStageInRegion:(MTLRegion)region
+{
+	(void)region;
+	[self akRefuse:@"a stage-in region (not served)"];
+}
+- (void)setStageInRegionWithIndirectBuffer:(id<MTLBuffer>)buffer indirectBufferOffset:(NSUInteger)offset
+{
+	(void)buffer; (void)offset;
+	[self akRefuse:@"an indirect stage-in region (not served)"];
+}
 
 - (void)endEncoding
 {

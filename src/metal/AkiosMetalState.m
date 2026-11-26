@@ -92,6 +92,7 @@ akios_next_id(void)
 - (id)device { return _akDevice; }
 - (NSString *)label { return _akLabel; }
 - (BOOL)supportIndirectCommandBuffers { return NO; }
+- (MTLForwardProgressUsage)forwardProgressUsage { return (MTLForwardProgressUsage)0; }
 
 @end
 
