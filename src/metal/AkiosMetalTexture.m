@@ -45,6 +45,23 @@ akios_layered(unsigned type)
 - (void)akSetCore:(hakios_metal_texture *)core
 {
 	_akCore = core;
+	[self akLive];
+}
+
+/* (11-26) its memory among the live (akios_live_add): a view's is its parent's, kept alive by it */
+- (void)akLive
+{
+	uint64_t va = 0, size = 0;
+	char what[72];
+
+	if (_akCore == NULL || !hakios_metal_texture_range(_akCore, &va, &size)) return;
+	IOSurfaceRef surface = [self iosurface];
+	int at = snprintf(what, sizeof(what), "a texture %lux%lu of format %lu%s", (unsigned long)[self width], (unsigned long)[self height],
+	    (unsigned long)[self pixelFormat], [(id<MTLTexture>)self parentTexture] != nil ? " (a view)" : "");
+	if (surface != NULL && at > 0 && at < (int)sizeof(what)) {
+		snprintf(what + at, sizeof(what) - (size_t)at, " over IOSurface %u", IOSurfaceGetID(surface));
+	}
+	akios_live_add((__bridge void *)self, va, size, what);
 }
 
 /* --- views (plan 1.6): IOGPU's view of the same resource, the core's view of the same memory --- */
@@ -118,6 +135,7 @@ akios_layered(unsigned type)
 
 	/* (a system-memory resource is mapped into the task at its GPU address: akios_iogpu.cpp s_new_resource) */
 	_akCore = hakios_metal_texture_wrap(core, layout, gpu, (void *)(uintptr_t)(cpu != 0 ? cpu : gpu));
+	[self akLive];
 	return _akCore != NULL;
 }
 
@@ -128,6 +146,7 @@ akios_layered(unsigned type)
 
 - (void)dealloc
 {
+	akios_live_remove((__bridge void *)self);
 	hakios_metal_texture_free(_akCore);   /* (a command buffer that uses it holds the wrapper until it has completed) */
 }
 

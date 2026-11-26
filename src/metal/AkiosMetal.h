@@ -142,6 +142,13 @@ void akios_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void akios_texture_note(const char *kind, id<MTLTexture> texture, MTLTextureDescriptor *descriptor, IOSurfaceRef surface,
     NSUInteger plane, void *caller);
 /* once a process (a line about a refusal that would otherwise repeat every frame) */
+/* (11-26) THE LIVE MEMORY: every IOGPU resource of this process the plug-in made (buffers, textures, the core's own
+ * memory), by its object, with what it is; a command buffer whose work names memory none of them covers is failed at
+ * -commit, said with what was there before (akios_live_check), instead of faulting the GPU and losing the submissions
+ * behind it */
+void akios_live_add(const void *owner, uint64_t va, uint64_t size, const char *what);
+void akios_live_remove(const void *owner);
+BOOL akios_live_check(uint64_t va, uint64_t size, char *why, size_t why_size);
 #define AK_ONCE(...) do { static int ak_said_; if (!ak_said_) { ak_said_ = 1; akios_say(__VA_ARGS__); } } while (0)
 /* a word in the boot-args (read once a process) */
 BOOL akios_boot_arg(const char *word);
@@ -242,6 +249,10 @@ unsigned akios_function_constants(id function, hakios_metal_constant *out, unsig
 	int _specBinding;
 	unsigned _specLength;
 	NSMutableDictionary *_specialised;
+	/* (11-26) a deferred one's: the bytes of that buffer that decide its control flow (bit a byte), the only ones a
+	 * content is told apart by (hakios_metal_program_control_mask); _specMasked 0: all bytes */
+	uint8_t _specMask[32];
+	int _specMasked;
 	char _standIn[256];                 /* not empty: a stand-in, no program -- why it could not be built (akm_stand_in) */
 }
 - (instancetype)initWithAkiosDevice:(AkiosMaliDevice *)device program:(hakios_metal_program *)program

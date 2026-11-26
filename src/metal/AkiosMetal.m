@@ -20,6 +20,8 @@
 #import "AkiosMetal.h"
 
 #include <dlfcn.h>
+#include <mach/mach.h>
+#include <os/lock.h>
 #include <fcntl.h>
 #include <os/log.h>
 #include <pthread.h>
@@ -291,6 +293,105 @@ akios_texture_note(const char *kind, id<MTLTexture> texture, MTLTextureDescripto
 	}
 }
 
+/* ---- the live memory (11-26) ---- */
+
+struct akm_live { const void *owner; uint64_t va, size; uint32_t ms; char what[72]; };
+struct akm_gone { uint64_t va, size; uint32_t made_ms, gone_ms; char what[72]; };
+static struct akm_live *akm_lives;
+static unsigned akm_live_count, akm_live_room;
+static struct akm_gone akm_gones[256];
+static unsigned akm_gone_next;
+static os_unfair_lock akm_live_lock = OS_UNFAIR_LOCK_INIT;
+
+static uint32_t
+akm_now_ms(void)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint32_t)(now.tv_sec * 1000 + now.tv_nsec / 1000000);
+}
+
+void
+akios_live_add(const void *owner, uint64_t va, uint64_t size, const char *what)
+{
+	if (owner == NULL || va == 0 || size == 0) return;
+	os_unfair_lock_lock(&akm_live_lock);
+	if (akm_live_count == akm_live_room) {
+		unsigned room = akm_live_room ? akm_live_room * 2 : 1024;
+		struct akm_live *grown = realloc(akm_lives, room * sizeof(*grown));
+
+		if (grown == NULL) {
+			os_unfair_lock_unlock(&akm_live_lock);
+			return;
+		}
+		akm_lives = grown;
+		akm_live_room = room;
+	}
+	struct akm_live *e = &akm_lives[akm_live_count++];
+	e->owner = owner;
+	e->va = va;
+	e->size = size;
+	e->ms = akm_now_ms();
+	snprintf(e->what, sizeof(e->what), "%s", what ? what : "?");
+	os_unfair_lock_unlock(&akm_live_lock);
+}
+
+void
+akios_live_remove(const void *owner)
+{
+	if (owner == NULL) return;
+	os_unfair_lock_lock(&akm_live_lock);
+	for (unsigned i = akm_live_count; i-- > 0;) {
+		if (akm_lives[i].owner == owner) {
+			struct akm_gone *g = &akm_gones[akm_gone_next++ % 256];
+
+			g->va = akm_lives[i].va;
+			g->size = akm_lives[i].size;
+			g->made_ms = akm_lives[i].ms;
+			g->gone_ms = akm_now_ms();
+			memcpy(g->what, akm_lives[i].what, sizeof(g->what));
+			akm_lives[i] = akm_lives[--akm_live_count];
+		}
+	}
+	os_unfair_lock_unlock(&akm_live_lock);
+}
+
+BOOL
+akios_live_check(uint64_t va, uint64_t size, char *why, size_t why_size)
+{
+	BOOL live = NO;
+
+	os_unfair_lock_lock(&akm_live_lock);
+	for (unsigned i = 0; i < akm_live_count && !live; i++) {
+		live = akm_lives[i].va <= va && va + size <= akm_lives[i].va + akm_lives[i].size;
+	}
+	if (!live && why != NULL) {
+		const uint32_t now = akm_now_ms();
+		int at = snprintf(why, why_size, "GPU memory 0x%llx (+%llu) that no live resource of this process covers",
+		    (unsigned long long)va, (unsigned long long)size);
+		/* the latest resource gone that covered it, and what lives across it now */
+		for (unsigned k = 0; k < 256 && at < (int)why_size; k++) {
+			const struct akm_gone *g = &akm_gones[(akm_gone_next - 1 - k) % 256];
+
+			if (g->size != 0 && g->va < va + size && va < g->va + g->size) {
+				at += snprintf(why + at, why_size - (size_t)at, "; it was %s (0x%llx, %llu bytes), made %u ms and freed %u ms ago",
+				    g->what, (unsigned long long)g->va, (unsigned long long)g->size, now - g->made_ms, now - g->gone_ms);
+				break;
+			}
+		}
+		for (unsigned i = 0; i < akm_live_count && at < (int)why_size; i++) {
+			if (akm_lives[i].va < va + size && va < akm_lives[i].va + akm_lives[i].size) {
+				at += snprintf(why + at, why_size - (size_t)at, "; overlapping it now: %s (0x%llx, %llu bytes)", akm_lives[i].what,
+				    (unsigned long long)akm_lives[i].va, (unsigned long long)akm_lives[i].size);
+				break;
+			}
+		}
+	}
+	os_unfair_lock_unlock(&akm_live_lock);
+	return live;
+}
+
 BOOL
 akios_boot_arg(const char *word)
 {
@@ -340,6 +441,54 @@ akios_strict(void)
 - (id<MTLBuffer>)akiosBuffer:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
     deallocator:(void (^)(void *, NSUInteger))deallocator wrap:(BOOL)wrap;
 @end
+
+/*
+ * (11-26) A BUFFER OVER THE CALLER'S MEMORY THE KERNEL REFUSED (kind 0x80: "wiring it failed 0x2", KERN_INVALID_ADDRESS
+ * -- the range is not all mapped): who asked (image + offset), and what the task's memory map has there, region by
+ * region (start, end, protection, user tag, share mode) -- whether the range runs past an allocation, into a hole or a
+ * guard page, or is memory already given back. Said 24 times.
+ */
+static __thread void *akm_nocopy_caller;
+
+static void
+akm_say_client_memory(void *pointer, NSUInteger length, void *caller)
+{
+	static unsigned said;
+	char where[160] = "?", map[600] = "";
+	Dl_info info;
+	int at = 0;
+
+	if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) >= 24) return;
+	if (caller != NULL && dladdr(caller, &info) != 0 && info.dli_fname != NULL) {
+		const char *base = strrchr(info.dli_fname, '/');
+		snprintf(where, sizeof(where), "%s+0x%lx", base ? base + 1 : info.dli_fname,
+		    (unsigned long)((uintptr_t)caller - (uintptr_t)info.dli_fbase));
+	}
+	vm_address_t addr = (vm_address_t)(uintptr_t)pointer & ~(vm_address_t)(vm_page_size - 1);
+	const vm_address_t end = (vm_address_t)(uintptr_t)pointer + length;
+	for (unsigned regions = 0; addr < end && regions < 6 && at < (int)sizeof(map) - 120; regions++) {
+		vm_size_t size = 0;
+		natural_t depth = 0;
+		vm_region_submap_info_data_64_t r;
+		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+		vm_address_t found = addr;
+
+		if (vm_region_recurse_64(mach_task_self(), &found, &size, &depth, (vm_region_recurse_info_64_t)&r, &count) != KERN_SUCCESS) {
+			at += snprintf(map + at, sizeof(map) - (size_t)at, " [nothing mapped from 0x%llx on]", (unsigned long long)addr);
+			break;
+		}
+		if (found > addr) {
+			at += snprintf(map + at, sizeof(map) - (size_t)at, " [HOLE 0x%llx..0x%llx]", (unsigned long long)addr,
+			    (unsigned long long)(found < end ? found : end));
+			if (found >= end) break;
+		}
+		at += snprintf(map + at, sizeof(map) - (size_t)at, " [0x%llx..0x%llx prot %d/%d tag %u share %u%s]", (unsigned long long)found,
+		    (unsigned long long)(found + size), r.protection, r.max_protection, r.user_tag, r.share_mode, r.is_submap ? " submap" : "");
+		addr = found + size;
+	}
+	akios_say("refused: a buffer over the caller's memory %p + %lu (to %p) from %s: IOGPU made no resource of it; the map there:%s\n",
+	    pointer, (unsigned long)length, (void *)((uint8_t *)pointer + length), where, map);
+}
 
 /* SIZE bytes for the core (its blit shaders, kernels' code, streams, spill space, staging): an internal buffer of this
  * device -- in IOGPU's connection, so in the address space the streams run in; the core holds it until it gives it back */
@@ -528,6 +677,15 @@ akm_iogpu_for(io_service_t port)
 	if (buffer != nil && wrap && _akCore != NULL) {
 		[buffer akWrap:_akCore];
 	}
+	if (buffer != nil && [buffer gpuAddress] != 0) {
+		char what[72];
+
+		snprintf(what, sizeof(what), "%s of %lu bytes%s", wrap ? "a buffer" : "the core's memory", (unsigned long)length,
+		    pointer != NULL ? " over the caller's memory" : "");
+		akios_live_add((__bridge void *)buffer, [buffer gpuAddress], pointer != NULL ? length : sysMemSize, what);
+	} else if (pointer != NULL) {
+		akm_say_client_memory(pointer, length, akm_nocopy_caller);
+	}
 	return (id<MTLBuffer>)buffer;
 }
 
@@ -549,7 +707,10 @@ akm_iogpu_for(io_service_t port)
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
     deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-	return [self akiosBuffer:pointer length:length options:options deallocator:deallocator wrap:YES];
+	akm_nocopy_caller = __builtin_return_address(0);   /* (said by akm_say_client_memory when the kernel refuses it) */
+	id<MTLBuffer> buffer = [self akiosBuffer:pointer length:length options:options deallocator:deallocator wrap:YES];
+	akm_nocopy_caller = NULL;
+	return buffer;
 }
 
 @end
@@ -580,6 +741,7 @@ akm_iogpu_for(io_service_t port)
 - (void)dealloc
 {
 	/* (a command buffer that used it holds the wrapper, and this object, until it has completed) */
+	akios_live_remove((__bridge void *)self);
 	hakios_metal_buffer_free(_akCore);
 }
 
@@ -776,6 +938,29 @@ akm_res_offset(void)
 	[self commitEncoder];
 	if (!akios_boot_arg("metal_nolist")) {
 		[self akListResources];
+	}
+	if (_akCore != NULL && !akios_boot_arg("metal_nolivecheck")) {
+		/* (11-26) what the work names, still there? A use after free fails the command buffer here, said with what
+		 * the memory was -- not a GPU fault that also takes the submissions after it */
+		static uint64_t va[1024], size[1024];
+		static os_unfair_lock checking = OS_UNFAIR_LOCK_INIT;
+		char why[600];
+
+		os_unfair_lock_lock(&checking);
+		const unsigned n = hakios_metal_cb_ranges(_akCore, va, size, 1024);
+		for (unsigned i = 0; i < n; i++) {
+			if (!akios_live_check(va[i], size[i], why, sizeof(why))) {
+				static unsigned said;
+				const unsigned k = said++;
+				if (k < 24 || (k & (k - 1)) == 0) {
+					akios_say("refused: a command buffer (%s) whose work uses %s; the command buffer is failed, nothing of it "
+					    "goes to the GPU (%u times)\n", [[(id<MTLCommandBuffer>)self label] UTF8String] ?: "no label", why, k + 1);
+				}
+				hakios_metal_cb_fail(_akCore, "its work uses GPU memory no live resource covers (a use after free)");
+				break;
+			}
+		}
+		os_unfair_lock_unlock(&checking);
 	}
 	if (_akCore != NULL) {
 		uint64_t va = 0;

@@ -359,8 +359,11 @@ akm_spend_clears(struct hakios_metal_render_pass *pass)
 	memcpy(_fsConstants, real->_fsConstants, sizeof(_fsConstants));
 	_fsConstantCount = real->_fsConstantCount;
 	_specLength = real->_specLength;
+	memcpy(_specMask, real->_specMask, sizeof(_specMask));
+	_specMasked = real->_specMasked;
 	_specialised = [[NSMutableDictionary alloc] init];
 	__atomic_store_n(&_specBinding, real->_specBinding, __ATOMIC_RELEASE);
+	[self akWarm];          /* (11-26: a deferred one's contents seen before; nothing for the rest) */
 }
 
 /* boot-arg metal_nospec: every draw with the pipeline's own program, no uber shader specialised */
@@ -385,8 +388,14 @@ akm_spec_off(void)
  * compiled for each content of the buffer (hakios_metal_program_specialize). */
 - (void)akKeepFragment:(NSData *)air constants:(const hakios_metal_constant *)constants count:(unsigned)count
 {
+	const unsigned words = hakios_metal_program_stage_words(_program, 1);
+	/* (11-26) 0 words: the core did not compile the fragment stage whole (too big: iOS 27's generic fixed_frag_lph_cpf,
+	 * VfxXgh + A3Xghfc / A2Xghfc, decided by its 52-byte config_buffer) -- only its specialisations draw, so they are
+	 * asked for whatever metal_nospec says */
+	const BOOL deferred = _program != NULL && words == 0;
+
 	_specBinding = -1;
-	if (akm_spec_off() || hakios_metal_program_stage_words(_program, 1) < 4096) return;
+	if (!deferred && (akm_spec_off() || words < 4096)) return;
 	for (unsigned i = 0; i < hakios_metal_program_resource_count(_program, 1); i++) {
 		unsigned kind, index, size;
 
@@ -400,68 +409,169 @@ akm_spec_off(void)
 	_fsAir = air;
 	_fsConstantCount = count < 64 ? count : 64;
 	memcpy(_fsConstants, constants, _fsConstantCount * sizeof(*constants));
+	_specMasked = deferred ? hakios_metal_program_control_mask(_program, (unsigned)_specBinding, _specMask) : 0;
 	_specialised = [[NSMutableDictionary alloc] init];
+	if (deferred) [self akWarm];
+}
+
+static dispatch_queue_t
+akm_spec_queue(void)
+{
+	static dispatch_queue_t q;
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		q = dispatch_queue_create("akios.metal.specialise", DISPATCH_QUEUE_SERIAL);
+	});
+	return q;
+}
+
+/* A specialisation's entry in _specialised: NSNull while it is asked for and not made, an NSValue (the program) once
+ * made, the string @"failed" when it could not be made (not an NSNumber: that is an NSValue too). On akm_spec_queue only (one compile at a time, in the order asked). */
+- (void)akSpecialiseKey:(NSData *)key why:(const char *)why
+{
+	@synchronized(self) {
+		if (![[_specialised objectForKey:key] isKindOfClass:[NSNull class]]) return;   /* made, failed, or not asked */
+	}
+	struct timespec t0, t1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
+								 (unsigned)_specBinding, [key bytes], [key length]);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	const double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+	static int said;
+	if (p == NULL) {
+		akios_say("specialise: %s for its buffer %d: %s; %s\n", hakios_metal_program_name(_program), _specBinding,
+			 hakios_metal_error(), hakios_metal_program_stage_words(_program, 1) == 0 ? "its draws with these bytes are skipped" :
+			 "its own program goes on");
+	} else if (said < 24 || ms >= 100) {
+		/* (11-26: every slow one said, past the first 24 too -- a compile, not the cache) */
+		akios_say("specialise: %s for %u bytes of its buffer %d: %u instruction words, not %u, in %.0f ms (%s)\n", hakios_metal_program_name(_program),
+			 (unsigned)[key length], _specBinding, hakios_metal_program_stage_words(p, 1), hakios_metal_program_stage_words(_program, 1), ms, why);
+	}
+	if (p == NULL || said++ < 24) {
+		/* (11-11: the bytes, for tools/mesa/pan/mali_stage_host's BINDING:HEX) */
+		char hex[2 * 256 + 1] = "";
+		const uint8_t *kb = (const uint8_t *)[key bytes];
+		for (unsigned i = 0; i < [key length] && i < 256; i++) {
+			snprintf(hex + 2 * i, 3, "%02x", kb[i]);
+		}
+		akios_say("specialise: %s, buffer %d holds %s\n", [[(id)self label] UTF8String] ?: "?", _specBinding, hex);
+	}
+	@synchronized(self) {
+		[_specialised setObject:(p != NULL ? (id)[NSValue valueWithPointer:p] : (id)@"failed") forKey:key];
+	}
+}
+
+/* (11-26) THE CONTENTS SEEN BEFORE, LOADED AHEAD: a deferred pipeline (akKeepFragment) draws only with programs made for
+ * its buffer's contents. The core keeps every content a program was made for beside its cache
+ * (hakios_metal_program_seen_contents), and those programs are in that cache: they are asked for now, in the
+ * background, so that a draw finds them made instead of waiting for the cache's read. */
+- (void)akWarm
+{
+	enum { EACH = 256, MOST = 256 };
+
+	if (_specBinding < 0 || _program == NULL || hakios_metal_program_stage_words(_program, 1) != 0) return;
+	uint8_t *seen = malloc((size_t)EACH * MOST);
+	unsigned lengths[MOST];
+	if (seen == NULL) return;
+	unsigned n = hakios_metal_program_seen_contents(_program, (unsigned)_specBinding, seen, EACH, lengths, MOST);
+	NSMutableArray *keys = [NSMutableArray array];
+	@synchronized(self) {
+		for (unsigned i = 0; i < n; i++) {
+			NSData *key = [NSData dataWithBytes:seen + (size_t)i * EACH length:lengths[i]];
+			if ([_specialised objectForKey:key] == nil && [_specialised count] < 256) {
+				[_specialised setObject:[NSNull null] forKey:key];
+				[keys addObject:key];
+			}
+		}
+	}
+	free(seen);
+	if ([keys count] == 0) return;
+	dispatch_async(akm_spec_queue(), ^{
+		struct timespec t0, t1;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		for (NSData *key in keys) [self akSpecialiseKey:key why:"seen on an earlier boot"];
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		akios_say("specialise: %s: %lu contents of its buffer %d seen before, loaded ahead in %.0f ms\n", hakios_metal_program_name(_program),
+			 (unsigned long)[keys count], _specBinding, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+	});
 }
 
 /* the program for a draw whose fragment buffers are BUFFERS: the one compiled for what the deciding buffer holds, or
  * the pipeline's own while that one compiles (on a queue of its own: a compilation is 0.4 s on the host, and a frame
- * must not wait for it). 64 contents at most a pipeline; past them the pipeline's own. */
+ * must not wait for it). 64 contents at most a pipeline; past them the pipeline's own.
+ * (11-26) A DEFERRED PIPELINE (akKeepFragment: its own fragment stage was not compiled) has nothing of its own to draw
+ * with, and a skipped draw is not drawn again -- CoreAnimation repaints only what changed, so Setup kept blank and
+ * half-old regions. So its draw WAITS for its content's program: made on the same queue, this thread waiting for it
+ * (0.4-1 s on the phone the first time a content is seen; from the cache, or loaded ahead by akWarm, after that).
+ * NULL only when none can be made (said) or past 256 contents; a buffer shorter than the declared size is taken as
+ * it is (the front end leaves a load past it a load). */
 - (hakios_metal_program *)akProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
 {
-	static dispatch_queue_t compiling;
-	static dispatch_once_t once;
+	const BOOL deferred = _program != NULL && hakios_metal_program_stage_words(_program, 1) == 0;
+	hakios_metal_program *own = deferred ? NULL : _program;
 
 	if (__atomic_load_n(&_specBinding, __ATOMIC_ACQUIRE) < 0 || (unsigned)_specBinding >= count || buffers[_specBinding] == NULL ||
-	    _program == NULL) return _program;
+	    _program == NULL) return own;
 	const uint8_t *bytes = (const uint8_t *)hakios_metal_buffer_contents(buffers[_specBinding]);
 	const uint64_t length = hakios_metal_buffer_length(buffers[_specBinding]), at = offsets[_specBinding];
-	if (bytes == NULL || at > length || length - at < _specLength) return _program;
-	NSData *key = [NSData dataWithBytes:bytes + at length:_specLength];
-	hakios_metal_program *found = _program;
-	BOOL start = NO;
+	uint64_t take = _specLength;
+	if (bytes == NULL || at >= length) return own;
+	if (length - at < take) {
+		if (!deferred) return own;
+		take = length - at;
+	}
+	NSData *key;
+	if (_specMasked) {
+		/* (11-26) only the bytes that decide its control flow tell its programs apart: the rest zero, as the core
+		 * keys and folds them (its program reads them from the buffer) -- a float or a colour in it no longer
+		 * makes a new program */
+		uint8_t masked[256];
+		for (uint64_t i = 0; i < take; i++) {
+			masked[i] = i < 256 && (_specMask[i / 8] & (1u << (i % 8))) ? bytes[at + i] : 0;
+		}
+		key = [NSData dataWithBytes:masked length:(NSUInteger)take];
+	} else {
+		key = [NSData dataWithBytes:bytes + at length:(NSUInteger)take];
+	}
+	hakios_metal_program *found = own;
+	BOOL start = NO, wait = NO, full = NO;
 
 	@synchronized(self) {
 		id have = [_specialised objectForKey:key];
 
 		if ([have isKindOfClass:[NSValue class]]) {
 			found = (hakios_metal_program *)[have pointerValue];
-		} else if (have == nil && [_specialised count] < 64) {
+		} else if (have == nil && [_specialised count] < (deferred ? 256u : 64u)) {
 			[_specialised setObject:[NSNull null] forKey:key];
 			start = YES;
+		} else if (have == nil) {
+			full = deferred;
+		}
+		wait = deferred && (start || [have isKindOfClass:[NSNull class]]);
+	}
+	if (full) {
+		static int told;
+		if (told++ == 0) {
+			akios_say("specialise: %s has 256 contents of its buffer %d made; draws with another are skipped\n",
+				 hakios_metal_program_name(_program), _specBinding);
 		}
 	}
-	if (start) {
-		dispatch_once(&once, ^{
-			compiling = dispatch_queue_create("akios.metal.specialise", DISPATCH_QUEUE_SERIAL);
+	if (wait) {
+		/* behind what the queue has already (a compile asked for earlier, contents loaded ahead), then this one */
+		dispatch_sync(akm_spec_queue(), ^{
+			[self akSpecialiseKey:key why:"a draw waited for it"];
 		});
-		dispatch_async(compiling, ^{
-			struct timespec t0, t1;
-
-			clock_gettime(CLOCK_MONOTONIC, &t0);
-			hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
-										 (unsigned)_specBinding, [key bytes], [key length]);
-			clock_gettime(CLOCK_MONOTONIC, &t1);
-			static int said;
-			if (p == NULL) {
-				akios_say("specialise: %s for its buffer %d: %s; its own program goes on\n", hakios_metal_program_name(_program), _specBinding,
-					 hakios_metal_error());
-			} else if (said < 24) {
-				akios_say("specialise: %s for %u bytes of its buffer %d: %u instruction words, not %u, in %.0f ms\n", hakios_metal_program_name(_program),
-					 _specLength, _specBinding, hakios_metal_program_stage_words(p, 1), hakios_metal_program_stage_words(_program, 1),
-					 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
-			}
-			if (said++ < 24) {
-				/* (11-11: the bytes, for tools/mesa/pan/mali_stage_host's BINDING:HEX) */
-				char hex[2 * 256 + 1] = "";
-				const uint8_t *kb = (const uint8_t *)[key bytes];
-				for (unsigned i = 0; i < [key length] && i < 256; i++) {
-					snprintf(hex + 2 * i, 3, "%02x", kb[i]);
-				}
-				akios_say("specialise: %s, buffer %d holds %s\n", [[(id)self label] UTF8String] ?: "?", _specBinding, hex);
-			}
-			@synchronized(self) {
-				if (p != NULL) [_specialised setObject:[NSValue valueWithPointer:p] forKey:key];
-			}
+		@synchronized(self) {
+			id have = [_specialised objectForKey:key];
+			found = [have isKindOfClass:[NSValue class]] ? (hakios_metal_program *)[have pointerValue] : NULL;
+		}
+	} else if (start) {
+		dispatch_async(akm_spec_queue(), ^{
+			[self akSpecialiseKey:key why:"in the background"];
 		});
 	}
 	return found;
@@ -1273,6 +1383,12 @@ akm_trace_draw(const void *which, const char *program, const struct hakios_metal
 	}
 	hakios_metal_cb_set_vertex_textures(cb, vsTex, _vsHighestTexture, vsSamp, _vsHighestSampler);
 	hakios_metal_program *program = [_pipeline akProgramFor:fs offsets:_fsOffsets count:_fsHighest];
+	if (program == NULL) {
+		/* (11-26) an uber shader drawn only by its specialisations (akProgramFor: waits for them), none to be had for
+		 * this content (said there): skipped, quietly, as a stand-in's draws are */
+		hakios_metal_cb_refuse(cb, "an uber shader with no program for this content of its buffer");
+		return;
+	}
 
 	akm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);
 	if (akm_trace_draw([_pipeline akProgram], hakios_metal_program_name([_pipeline akProgram]), &_pass, fsTex, _fsHighestTexture, (unsigned)primitive, 0)) {
