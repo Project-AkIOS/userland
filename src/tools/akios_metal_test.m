@@ -21,6 +21,13 @@
  *   D5. a heap: a texture from it written by a kernel, a buffer from it filled by a blit
  *   D6. a texture view with a swizzle (red and blue swapped) sampled by tex_sample_gid
  *   D7. CoreAnimation's std_vert1_lph + inplace_copy_lph from QuartzCore's default.metallib made a pipeline
+ *   D8. what CoreAnimation does for an asynchronous layer's surface (CA::OGL::AsynchronousNode::retain_surface ->
+ *       MetalContext::create_surface_from_iosurface, where backboardd aborted on the unlock): a full-screen 'RGhA'
+ *       IOSurface (1080x2340, RGBA16Float) made a texture (usage read + render target, labelled), a memoryless
+ *       RGBA16Float and a memoryless R32Float beside it; x19..x28 must come back from those calls as they went in
+ *       (CoreAnimation keeps its context in x19 across them); a pass draws into the three (clear + triangle), the
+ *       surface is read on the CPU and sampled by tex_sample_gid; then 8 rounds of new surfaces made, drawn and let
+ *       go, with 2048 blocks of CoreAnimation's Surface size (0x140) on the heap checked untouched after them
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -102,6 +109,142 @@ static const char *
 cb_error(id<MTLCommandBuffer> cb)
 {
 	return cb.error != nil ? cb.error.localizedDescription.UTF8String : "no error";
+}
+
+/*
+ * D8's register check: FN(CTX) called with x19..x28 holding known values; the answer is a bit for each of them that came
+ * back changed (bit 0 x19 .. bit 9 x28) and bit 10 when sp did not. The calling convention keeps x19..x28 for the
+ * caller; a call that broke it would leave CoreAnimation's create_surface_from_iosurface with a stray context in x19 --
+ * the surface tracked on the wrong object, then not found by push_surface, which is the assertion backboardd died on.
+ */
+extern unsigned long akt_preserved(void (*fn)(void *), void *ctx) __asm__("_akt_preserved");
+#if __has_feature(ptrauth_calls)
+#define AKT_CALL "	blraaz	x9\n"       /* (a C function pointer: signed with key IA, discriminator 0) */
+#else
+#define AKT_CALL "	blr	x9\n"
+#endif
+#define AKT_SET(r) "	mov	x" #r ", #0x" #r "\n	movk	x" #r ", #0xa5a5, lsl #48\n"
+#define AKT_CMP(r, bit) "	mov	x11, #0x" #r "\n	movk	x11, #0xa5a5, lsl #48\n	cmp	x" #r ", x11\n	cset	x12, ne\n" \
+	"	orr	x10, x10, x12, lsl #" #bit "\n"
+__asm__(
+	"	.text\n"
+	"	.p2align 2\n"
+	"	.private_extern _akt_preserved\n"
+	"	.globl _akt_preserved\n"
+	"_akt_preserved:\n"
+	"	stp	x29, x30, [sp, #-96]!\n"
+	"	mov	x29, sp\n"
+	"	stp	x19, x20, [sp, #16]\n"
+	"	stp	x21, x22, [sp, #32]\n"
+	"	stp	x23, x24, [sp, #48]\n"
+	"	stp	x25, x26, [sp, #64]\n"
+	"	stp	x27, x28, [sp, #80]\n"
+	"	mov	x9, x0\n"
+	"	mov	x0, x1\n"
+	AKT_SET(19) AKT_SET(20) AKT_SET(21) AKT_SET(22) AKT_SET(23) AKT_SET(24) AKT_SET(25) AKT_SET(26) AKT_SET(27) AKT_SET(28)
+	AKT_CALL
+	"	mov	x10, #0\n"
+	AKT_CMP(19, 0) AKT_CMP(20, 1) AKT_CMP(21, 2) AKT_CMP(22, 3) AKT_CMP(23, 4) AKT_CMP(24, 5) AKT_CMP(25, 6) AKT_CMP(26, 7)
+	AKT_CMP(27, 8) AKT_CMP(28, 9)
+	"	mov	x11, sp\n"
+	"	cmp	x11, x29\n"
+	"	cset	x12, ne\n"
+	"	orr	x10, x10, x12, lsl #10\n"
+	"	mov	x0, x10\n"
+	"	mov	sp, x29\n"
+	"	ldp	x19, x20, [sp, #16]\n"
+	"	ldp	x21, x22, [sp, #32]\n"
+	"	ldp	x23, x24, [sp, #48]\n"
+	"	ldp	x25, x26, [sp, #64]\n"
+	"	ldp	x27, x28, [sp, #80]\n"
+	"	ldp	x29, x30, [sp], #96\n"
+	"	ret\n");
+
+/* D8: CoreAnimation's calls for an asynchronous layer's surface, in its order (create_surface_from_iosurface, then
+ * add_memoryless_textures and add_path_buffer_texture): the results retained into the context */
+struct d8_make {
+	__unsafe_unretained id<MTLDevice> dev;
+	IOSurfaceRef surface;
+	unsigned width, height;
+	void *texture, *memoryless, *path;      /* (retained: CFBridgingRelease when done) */
+};
+
+static void
+d8_make(void *p)
+{
+	struct d8_make *c = p;
+
+	@autoreleasepool {
+		MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:c->width
+		    height:c->height mipmapped:NO];
+		d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;     /* (CoreAnimation's 5) */
+		id<MTLTexture> t = [c->dev newTextureWithDescriptor:d iosurface:c->surface plane:0];
+		t.label = @"akios_metal_test.D8.async";
+		id<MTLTexture> m = nil, r = nil;
+		if (t != nil) {
+			MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:t.width
+			    height:t.height mipmapped:NO];
+			md.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+			md.storageMode = MTLStorageModeMemoryless;
+			m = [c->dev newTextureWithDescriptor:md];
+			m.label = @"akios_metal_test.D8.memoryless";
+			MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:t.width
+			    height:t.height mipmapped:NO];
+			rd.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+			rd.storageMode = MTLStorageModeMemoryless;
+			r = [c->dev newTextureWithDescriptor:rd];
+			r.label = @"akios_metal_test.D8.path";
+		}
+		c->texture = t != nil ? (__bridge_retained void *)t : NULL;
+		c->memoryless = m != nil ? (__bridge_retained void *)m : NULL;
+		c->path = r != nil ? (__bridge_retained void *)r : NULL;
+	}
+}
+
+/* D8's pass over what d8_make made: colour 0 the surface (cleared, the triangle drawn, stored), 1 and 2 the memoryless
+ * ones (cleared, not stored), as CoreAnimation's passes have them */
+struct d8_draw {
+	__unsafe_unretained id<MTLCommandQueue> q;
+	__unsafe_unretained id<MTLRenderPipelineState> pipeline;
+	__unsafe_unretained id<MTLTexture> texture, memoryless, path;
+	long status;
+};
+
+static void
+d8_draw(void *p)
+{
+	struct d8_draw *c = p;
+
+	@autoreleasepool {
+		MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+		d.colorAttachments[0].texture = c->texture;
+		d.colorAttachments[0].loadAction = MTLLoadActionClear;
+		d.colorAttachments[0].storeAction = MTLStoreActionStore;
+		d.colorAttachments[0].clearColor = MTLClearColorMake(0.25, 0.5, 0.75, 1);
+		d.colorAttachments[1].texture = c->memoryless;
+		d.colorAttachments[1].loadAction = MTLLoadActionClear;
+		d.colorAttachments[1].storeAction = MTLStoreActionDontCare;
+		d.colorAttachments[2].texture = c->path;
+		d.colorAttachments[2].loadAction = MTLLoadActionClear;
+		d.colorAttachments[2].storeAction = MTLStoreActionDontCare;
+		id<MTLCommandBuffer> cb = [c->q commandBuffer];
+		id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:d];
+		[re setRenderPipelineState:c->pipeline];
+		[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[re endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		c->status = re != nil ? (long)cb.status : -1;
+	}
+}
+
+/* an 'RGhA' (RGBA16Float) IOSurface of W x H, as CoreAnimation's asynchronous layers have */
+static IOSurfaceRef
+d8_surface(unsigned w, unsigned h)
+{
+	NSDictionary *props = @{ (id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @8,
+	    (id)kIOSurfacePixelFormat: @((uint32_t)'RGhA') };
+	return IOSurfaceCreate((__bridge CFDictionaryRef)props);
 }
 
 int
@@ -771,6 +914,142 @@ main(int argc, char **argv)
 			    error && !cp ? error.localizedDescription.UTF8String : "");
 			if (cp == nil) {
 				return 27;
+			}
+		}
+
+		/* D8: an asynchronous layer's surface, made, drawn and sampled the way CoreAnimation does */
+		{
+			const unsigned AW = 1080, AH = 2340;
+			MTLRenderPipelineDescriptor *ad = [rpd copy];
+			ad.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+			ad.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
+			ad.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
+			ad.colorAttachments[2].pixelFormat = MTLPixelFormatR32Float;
+			ad.colorAttachments[2].writeMask = MTLColorWriteMaskNone;
+			id<MTLRenderPipelineState> ap = [dev newRenderPipelineStateWithDescriptor:ad error:&error];
+			IOSurfaceRef as = d8_surface(AW, AH);
+			printf("D8: pipeline (RGBA16Float + RGBA16Float + R32Float) %s%s%s; IOSurface %u 'RGhA' %zux%zu, rows of %zu bytes (%s)\n",
+			    ap ? "made" : "nil", ap ? "" : ": ", ap ? "" : (error ? error.localizedDescription.UTF8String : "?"),
+			    as ? IOSurfaceGetID(as) : 0, as ? IOSurfaceGetWidth(as) : 0, as ? IOSurfaceGetHeight(as) : 0,
+			    as ? IOSurfaceGetBytesPerRow(as) : 0, as && IOSurfaceGetBytesPerRow(as) % 64 == 0 ? "64-byte multiple" : "NOT 64-byte");
+			if (ap == nil || as == NULL) {
+				return 28;
+			}
+			struct d8_make mk = { .dev = dev, .surface = as, .width = AW, .height = AH };
+			const unsigned long kept = akt_preserved(d8_make, &mk);
+			id<MTLTexture> at8 = (__bridge_transfer id)mk.texture, ml = (__bridge_transfer id)mk.memoryless,
+			    pt = (__bridge_transfer id)mk.path;
+			printf("D8: texture over the surface %s (MTLPixelFormat %lu, %lux%lu, usage %#lx), memoryless RGBA16Float %s, memoryless "
+			    "R32Float %s; x19..x28 and sp across the calls: %s (mask %#lx)\n", at8 ? "made" : "nil", (unsigned long)at8.pixelFormat,
+			    (unsigned long)at8.width, (unsigned long)at8.height, (unsigned long)at8.usage, ml ? "made" : "nil", pt ? "made" : "nil",
+			    kept == 0 ? "kept" : "CHANGED", kept);
+			if (at8 == nil || ml == nil || pt == nil || kept != 0) {
+				return 28;
+			}
+			struct d8_draw dr = { .q = q, .pipeline = ap, .texture = at8, .memoryless = ml, .path = pt };
+			const unsigned long keptDraw = akt_preserved(d8_draw, &dr);
+			/* the surface on the CPU: near the top-left corner the triangle (blue the most), the top-right corner the clear
+			 * colour (0.25 0.5 0.75 1) -- the first triangle (-1, -1) (1, -1) (-1, 1) covers the lower-left half, the
+			 * bottom-right corner (its green vertex) with it */
+			float tlc[4], brc[4];
+			IOSurfaceLock(as, kIOSurfaceLockReadOnly, NULL);
+			const uint8_t *base = IOSurfaceGetBaseAddress(as);
+			const size_t arow = IOSurfaceGetBytesPerRow(as);
+			const __fp16 *p0 = (const __fp16 *)(base + arow * (AH / 10) + 8 * (AW / 32));
+			const __fp16 *p1 = (const __fp16 *)(base + arow * 2 + 8 * (AW - 3));
+			for (int k = 0; k < 4; k++) {
+				tlc[k] = (float)p0[k];
+				brc[k] = (float)p1[k];
+			}
+			IOSurfaceUnlock(as, kIOSurfaceLockReadOnly, NULL);
+			const BOOL cpuOk = tlc[2] > 0.7f && tlc[0] < 0.3f && tlc[1] < 0.3f && brc[0] > 0.2f && brc[0] < 0.3f && brc[1] > 0.45f &&
+			    brc[1] < 0.55f && brc[2] > 0.7f && brc[2] < 0.8f && brc[3] > 0.95f;
+			printf("D8: pass: status %ld; x19..x28 and sp across it: %s (mask %#lx); the surface read: near top-left %.3f %.3f %.3f %.3f "
+			    "(blue the most), top-right %.3f %.3f %.3f %.3f (0.25 0.5 0.75 1) -- %s\n", dr.status, keptDraw == 0 ? "kept" : "CHANGED",
+			    keptDraw, tlc[0], tlc[1], tlc[2], tlc[3], brc[0], brc[1], brc[2], brc[3], cpuOk ? "right" : "WRONG");
+			if (dr.status != MTLCommandBufferStatusCompleted || keptDraw != 0 || !cpuOk) {
+				return 28;
+			}
+			/* sampled: tex_sample_gid over a 16 x 16 grid -- texel 32 (column 0, row 2: NDC -0.94, 0.69, inside the
+			 * triangle, blue the most; texel 0 sits on its edge) and texel 15 near the top-right (the clear colour) */
+			id<MTLComputePipelineState> sp8 = [dev newComputePipelineStateWithFunction:[library newFunctionWithName:@"tex_sample_gid"]
+			    error:&error];
+			id<MTLSamplerState> nearest8 = [dev newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
+			id<MTLBuffer> out8 = [dev newBufferWithLength:256 * 16 options:MTLResourceStorageModeShared];
+			if (sp8 == nil || out8 == nil) {
+				printf("D8: tex_sample_gid %s, buffer %s\n", sp8 ? "made" : "nil", out8 ? "made" : "nil");
+				return 28;
+			}
+			id<MTLCommandBuffer> scb = [q commandBuffer];
+			id<MTLComputeCommandEncoder> sce = [scb computeCommandEncoder];
+			[sce setComputePipelineState:sp8];
+			[sce setTexture:at8 atIndex:0];
+			[sce setSamplerState:nearest8 atIndex:0];
+			[sce setBuffer:out8 offset:0 atIndex:0];
+			[sce dispatchThreads:MTLSizeMake(16, 16, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+			[sce endEncoding];
+			[scb commit];
+			[scb waitUntilCompleted];
+			const float *s8 = out8.contents;
+			const float *c15 = s8 + 4 * 15;
+			const float *c32 = s8 + 4 * 32;
+			const BOOL sampledOk = c32[2] > 0.7f && c32[0] < 0.3f && c15[0] > 0.2f && c15[0] < 0.3f && c15[1] > 0.45f && c15[1] < 0.55f &&
+			    c15[2] > 0.7f && c15[2] < 0.8f;
+			printf("D8: sampled: status %ld (%s); texel 32 %.3f %.3f %.3f %.3f (blue the most), texel 15 %.3f %.3f %.3f %.3f "
+			    "(0.25 0.5 0.75 1) -- %s\n", (long)scb.status, cb_error(scb), c32[0], c32[1], c32[2], c32[3], c15[0], c15[1], c15[2], c15[3],
+			    sampledOk ? "right" : "WRONG");
+			if (scb.status != MTLCommandBufferStatusCompleted || !sampledOk) {
+				return 28;
+			}
+			at8 = ml = pt = nil;
+			CFRelease(as);
+
+			/* rounds: new surfaces made, drawn and let go (the unlock's transition makes and drops them so), beside heap blocks
+			 * of CoreAnimation's Surface size that nothing of Metal's may touch */
+			enum { BLOCKS = 2048, BLOCK = 0x140 };
+			uint64_t **blocks = calloc(BLOCKS, sizeof(*blocks));
+			for (unsigned i = 0; i < BLOCKS; i++) {
+				blocks[i] = calloc(1, BLOCK);
+				for (unsigned k = 0; k < BLOCK / 8; k++) blocks[i][k] = 0xc0ffee0000000000ull | (uint64_t)i << 16 | k;
+			}
+			unsigned roundsOk = 0, regsBad = 0;
+			for (int round = 0; round < 8; round++) {
+				IOSurfaceRef rs = d8_surface(AW, AH);
+				struct d8_make rm = { .dev = dev, .surface = rs, .width = AW, .height = AH };
+				regsBad += akt_preserved(d8_make, &rm) != 0;
+				id<MTLTexture> rt = (__bridge_transfer id)rm.texture, rml = (__bridge_transfer id)rm.memoryless,
+				    rpt = (__bridge_transfer id)rm.path;
+				if (rt != nil && rml != nil && rpt != nil) {
+					struct d8_draw rd = { .q = q, .pipeline = ap, .texture = rt, .memoryless = rml, .path = rpt };
+					regsBad += akt_preserved(d8_draw, &rd) != 0;
+					roundsOk += rd.status == MTLCommandBufferStatusCompleted;
+				}
+				rt = rml = rpt = nil;
+				if (rs != NULL) CFRelease(rs);
+			}
+			/* (a last command buffer, waited for: whatever the rounds left to complete has) */
+			id<MTLCommandBuffer> fence = [q commandBuffer];
+			[fence commit];
+			[fence waitUntilCompleted];
+			unsigned touched = 0, firstBad = BLOCKS;
+			for (unsigned i = 0; i < BLOCKS; i++) {
+				for (unsigned k = 0; k < BLOCK / 8; k++) {
+					if (blocks[i][k] != (0xc0ffee0000000000ull | (uint64_t)i << 16 | k)) {
+						touched++;
+						if (firstBad == BLOCKS) firstBad = i;
+						break;
+					}
+				}
+				free(blocks[i]);
+			}
+			free(blocks);
+			printf("D8: 8 rounds of new surfaces: %u drawn, register checks failed %u; %u of %u heap blocks of 0x%x bytes touched\n",
+			    roundsOk, regsBad, touched, (unsigned)BLOCKS, (unsigned)BLOCK);
+			if (touched != 0) {
+				printf("D8: something wrote into memory it does not own: heap block %u first\n", firstBad);
+			}
+			if (roundsOk != 8 || regsBad != 0 || touched != 0) {
+				return 28;
 			}
 		}
 		CFRelease(surface);

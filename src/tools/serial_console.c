@@ -12,6 +12,7 @@
  * control). ^C while a program runs: SIGINT to its foreground process group (through the pty's line discipline, or by
  * kill() when it has no controlling terminal).
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -281,6 +282,56 @@ done:
 	}
 }
 
+/* built-ins for a system without its own ls and cat (11-26: a plug-in's trace file in /private/var/tmp, read over this
+ * port): "ls [DIR]" names, sizes and kinds; "cat FILE..." the bytes, newlines sent as CR LF */
+static void
+builtin_ls(const char *dir)
+{
+	DIR *d = opendir(dir);
+	struct dirent *e;
+
+	if (d == NULL) {
+		say("ls: %s: %s\n", dir, strerror(errno));
+		return;
+	}
+	while ((e = readdir(d)) != NULL) {
+		char path[1024];
+		struct stat st;
+
+		if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+			continue;
+		}
+		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+		if (lstat(path, &st) != 0) {
+			say("%s ?\n", e->d_name);
+			continue;
+		}
+		say("%10lld %s%s\n", (long long)st.st_size, e->d_name, S_ISDIR(st.st_mode) ? "/" : S_ISLNK(st.st_mode) ? "@" : "");
+	}
+	closedir(d);
+}
+
+static void
+builtin_cat(const char *path)
+{
+	char buf[512];
+	ssize_t n;
+	int fd = open(path, O_RDONLY);
+
+	if (fd < 0) {
+		say("cat: %s: %s\n", path, strerror(errno));
+		return;
+	}
+	while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
+		buf[n] = 0;
+		for (ssize_t i = 0; i < n; i++) {
+			if (buf[i] == 0) buf[i] = '.';
+		}
+		say("%s", buf);
+	}
+	close(fd);
+}
+
 static void
 command(char *line)
 {
@@ -309,8 +360,15 @@ command(char *line)
 		if (ioctl(port, HAKIOS_SERIAL_KLOG, &on) != 0) {
 			say("klog: %s\n", strerror(errno));
 		}
+	} else if (strcmp(argv[0], "ls") == 0 && access("/bin/ls", X_OK) != 0) {
+		builtin_ls(argc > 1 ? argv[1] : ".");
+	} else if (strcmp(argv[0], "cat") == 0 && argc > 1 && access("/bin/cat", X_OK) != 0) {
+		for (int i = 1; i < argc; i++) {
+			builtin_cat(argv[i]);
+		}
 	} else if (strcmp(argv[0], "help") == 0) {
 		say("cd [DIR]; reboot; exit; klog on|off (the kernel log on this port); sh (%s -i, when there is one);\n"
+		    "ls [DIR], cat FILE... (built in where the system has none);\n"
 		    "anything else: a program with its arguments ('...' and \"...\" quote), run on a pty; ^C interrupts it.\n",
 		    JB_SH);
 	} else if (strcmp(argv[0], "sh") == 0 && argc == 1) {

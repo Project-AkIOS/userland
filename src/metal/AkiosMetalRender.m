@@ -1498,12 +1498,29 @@ akm_trace_draw(const void *which, const char *program, const struct hakios_metal
 {
 	(void)resources; (void)count; (void)after; (void)before;
 }
-- (void)useResource:(id)resource usage:(MTLResourceUsage)usage { (void)resource; (void)usage; }
-- (void)useResource:(id)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages { (void)resource; (void)usage; (void)stages; }
-- (void)useResources:(const id *)resources count:(NSUInteger)count usage:(MTLResourceUsage)usage { (void)resources; (void)count; (void)usage; }
+/* (resources reached through argument buffers: kept, and listed with their usage, MTLResourceUsageRead 1 / Write 2 being
+ * the list's bits) */
+- (void)useResource:(id)resource usage:(MTLResourceUsage)usage
+{
+	[_akCommandBuffer akHold:resource usage:(unsigned)usage & 3u];
+}
+- (void)useResource:(id)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages
+{
+	(void)stages;
+	[_akCommandBuffer akHold:resource usage:(unsigned)usage & 3u];
+}
+- (void)useResources:(const id *)resources count:(NSUInteger)count usage:(MTLResourceUsage)usage
+{
+	for (NSUInteger i = 0; i < count; i++) {
+		[_akCommandBuffer akHold:resources[i] usage:(unsigned)usage & 3u];
+	}
+}
 - (void)useResources:(const id *)resources count:(NSUInteger)count usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages
 {
-	(void)resources; (void)count; (void)usage; (void)stages;
+	(void)stages;
+	for (NSUInteger i = 0; i < count; i++) {
+		[_akCommandBuffer akHold:resources[i] usage:(unsigned)usage & 3u];
+	}
 }
 - (void)useHeap:(id)heap { (void)heap; }
 - (void)useHeap:(id)heap stages:(MTLRenderStages)stages { (void)heap; (void)stages; }
@@ -1742,12 +1759,13 @@ akm_trace_draw(const void *which, const char *program, const struct hakios_metal
 	for (NSUInteger i = 0; i < 8; i++) {
 		MTLRenderPassColorAttachmentDescriptor *c = descriptor.colorAttachments[i];
 
-		[self akHold:c.texture];
-		[self akHold:c.resolveTexture];
+		/* (written by the pass; read too when loaded) */
+		[self akHold:c.texture usage:AKIOS_USE_WRITE | (c.loadAction == MTLLoadActionLoad ? AKIOS_USE_READ : 0)];
+		[self akHold:c.resolveTexture usage:AKIOS_USE_WRITE];
 	}
-	[self akHold:descriptor.depthAttachment.texture];
-	[self akHold:descriptor.stencilAttachment.texture];
-	[self akHold:descriptor.visibilityResultBuffer];
+	[self akHold:descriptor.depthAttachment.texture usage:AKIOS_USE_WRITE | AKIOS_USE_READ];
+	[self akHold:descriptor.stencilAttachment.texture usage:AKIOS_USE_WRITE | AKIOS_USE_READ];
+	[self akHold:descriptor.visibilityResultBuffer usage:AKIOS_USE_WRITE];
 }
 
 /* A pass that cannot be served fails the command buffer and gives no encoder: the caller's draws go to nil, and the

@@ -126,6 +126,10 @@ struct akios_cb_tail {
 };
 #define AKIOS_CB_ARGS_SIZE              (0x30 + sizeof(struct akios_cb_tail))
 #define AKIOS_RESOURCE_ARGS_SIZE        0x58
+/* the usage bits of a resource in a segment's resource list (IOGPUResourceListAddResource's third argument; what our
+ * kernel reads: a resource written by the command buffer is busy until it completes) */
+#define AKIOS_USE_READ                  1u
+#define AKIOS_USE_WRITE                 2u
 
 /* Metal's tables, as the earlier plug-in had them (31 buffers, 128 textures, 16 samplers a stage) */
 #define AKIOS_MAX_BUFFERS       31
@@ -133,6 +137,10 @@ struct akios_cb_tail {
 #define AKIOS_MAX_SAMPLERS      16
 
 void akios_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
+/* a texture made (TEXTURE) or refused (nil) noted for the record of what was made (AkiosMetal.m): KIND "plain",
+ * "iosurface", "buffer", "view"; CALLER the asking code (__builtin_return_address(0) in the Metal entry point) */
+void akios_texture_note(const char *kind, id<MTLTexture> texture, MTLTextureDescriptor *descriptor, IOSurfaceRef surface,
+    NSUInteger plane, void *caller);
 /* once a process (a line about a refusal that would otherwise repeat every frame) */
 #define AK_ONCE(...) do { static int ak_said_; if (!ak_said_) { ak_said_ = 1; akios_say(__VA_ARGS__); } } while (0)
 /* a word in the boot-args (read once a process) */
@@ -177,6 +185,8 @@ unsigned akios_function_constants(id function, hakios_metal_constant *out, unsig
 - (hakios_metal_cb *)akCore;
 /* OBJECT kept alive until the command buffer has completed (what its encoders bound) */
 - (void)akHold:(id)object;
+/* ... and how the GPU uses it, for IOGPU's resource list of the command buffer (AKIOS_USE_READ / AKIOS_USE_WRITE) */
+- (void)akHold:(id)object usage:(unsigned)usage;
 @end
 
 @interface AkiosMaliBlitEncoder : IOGPUMetalBlitCommandEncoder

@@ -10,6 +10,7 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <fcntl.h>
 #include <os/log.h>
 #include <stdbool.h>
@@ -537,6 +538,19 @@ fatal_signal(int sig, siginfo_t *info, void *context)
 	(void)context;
 	for (int i = 0; i < n; i++) {
 		say_frame(line, sizeof(line), &at, (uint64_t)__builtin_ptrauth_strip(frames[i], 0));
+	}
+	fprintf(stderr, "%s\n", line);
+	/* (11-26) which GPU code the process had: the loaded images naming Metal, IOGPU or our /akita -- backboardd's first
+	 * instance aborted in CoreAnimation without a line of its Metal plug-in's, and whether the plug-in was in it at all
+	 * was the question */
+	at = snprintf(line, sizeof(line), "hakios: fatal: %s[%d] images:", getprogname(), getpid());
+	for (uint32_t i = 0, count = _dyld_image_count(); i < count && at < (int)sizeof(line) - 200; i++) {
+		const char *name = _dyld_get_image_name(i);
+
+		if (name != NULL && (strstr(name, "Metal") != NULL || strstr(name, "IOGPU") != NULL || strstr(name, "/akita/") != NULL ||
+		    strstr(name, "AGX") != NULL)) {
+			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s", name);
+		}
 	}
 	fprintf(stderr, "%s\n", line);
 	signal(sig, SIG_DFL);

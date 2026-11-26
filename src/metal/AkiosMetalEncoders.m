@@ -39,6 +39,19 @@ akios_layered(unsigned type)
 
 - (id)device { return [_akCommandBuffer device]; }
 
+/* how a blit uses what it names: a destination, a fill and a texture given mipmaps are written; a source is read */
+static unsigned
+akm_blit_usage(const char *what)
+{
+	if (strcmp(what, "destination") == 0 || strcmp(what, "fill") == 0) {
+		return AKIOS_USE_WRITE;
+	}
+	if (strcmp(what, "texture") == 0) {
+		return AKIOS_USE_READ | AKIOS_USE_WRITE;
+	}
+	return AKIOS_USE_READ;
+}
+
 /* a buffer of this device (kept by the command buffer), or a refusal by name that fails the command buffer */
 - (hakios_metal_buffer *)akBuffer:(id)object what:(const char *)what
 {
@@ -53,7 +66,7 @@ akios_layered(unsigned type)
 		hakios_metal_cb_refuse([_akCommandBuffer akCore], why);
 		return NULL;
 	}
-	[_akCommandBuffer akHold:object];
+	[_akCommandBuffer akHold:object usage:akm_blit_usage(what)];
 	return b;
 }
 
@@ -70,7 +83,7 @@ akios_layered(unsigned type)
 		hakios_metal_cb_refuse([_akCommandBuffer akCore], why);
 		return NULL;
 	}
-	[_akCommandBuffer akHold:object];
+	[_akCommandBuffer akHold:object usage:akm_blit_usage(what)];
 	return t;
 }
 
@@ -554,11 +567,11 @@ akios_layered(unsigned type)
 	[_akCommandBuffer akHold:_akPipeline];
 	for (unsigned i = 0; i < _akHighest; i++) {
 		buffers[i] = _akBuffers[i] != nil ? [(AkiosMaliBuffer *)_akBuffers[i] akCore] : NULL;
-		[_akCommandBuffer akHold:_akBuffers[i]];
+		[_akCommandBuffer akHold:_akBuffers[i] usage:AKIOS_USE_READ | AKIOS_USE_WRITE];   /* (what the kernel writes: unknown here) */
 	}
 	for (unsigned i = 0; i < _akHighestTexture; i++) {
 		textures[i] = _akTextures[i] != nil ? [(AkiosMaliTexture *)_akTextures[i] akCore] : NULL;
-		[_akCommandBuffer akHold:_akTextures[i]];
+		[_akCommandBuffer akHold:_akTextures[i] usage:AKIOS_USE_READ | AKIOS_USE_WRITE];
 	}
 	for (unsigned i = 0; i < _akHighestSampler; i++) {
 		samplers[i] = _akSamplers[i] != nil ? [(AkiosMaliSamplerState *)_akSamplers[i] akCore] : NULL;
@@ -609,14 +622,12 @@ akios_layered(unsigned type)
 - (void)waitForFence:(id<MTLFence>)fence { (void)fence; }
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
 {
-	(void)usage;
-	[_akCommandBuffer akHold:resource];
+	[_akCommandBuffer akHold:resource usage:(unsigned)usage & 3u];
 }
 - (void)useResources:(const id<MTLResource> __unsafe_unretained *)resources count:(NSUInteger)count usage:(MTLResourceUsage)usage
 {
-	(void)usage;
 	for (NSUInteger i = 0; i < count; i++) {
-		[_akCommandBuffer akHold:resources[i]];
+		[_akCommandBuffer akHold:resources[i] usage:(unsigned)usage & 3u];
 	}
 }
 - (void)useHeap:(id<MTLHeap>)heap { [_akCommandBuffer akHold:heap]; }

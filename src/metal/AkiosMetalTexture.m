@@ -86,20 +86,29 @@ akios_layered(unsigned type)
 {
 	const NSUInteger slices = [self textureType] == MTLTextureType3D ? 1 : MAX(hakios_metal_texture_depth(_akCore), 1u);
 
-	return [self akViewWithPixelFormat:format type:[self textureType] levels:NSMakeRange(0, [self mipmapLevelCount])
+	id<MTLTexture> view = [self akViewWithPixelFormat:format type:[self textureType] levels:NSMakeRange(0, [self mipmapLevelCount])
 	    slices:NSMakeRange(0, akios_layered((unsigned)[self textureType]) ? slices : 1) swizzle:NULL];
+
+	akios_texture_note("view", view, nil, [self iosurface], [self iosurfacePlane], __builtin_return_address(0));
+	return view;
 }
 
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels
     slices:(NSRange)slices
 {
-	return [self akViewWithPixelFormat:format type:type levels:levels slices:slices swizzle:NULL];
+	id<MTLTexture> view = [self akViewWithPixelFormat:format type:type levels:levels slices:slices swizzle:NULL];
+
+	akios_texture_note("view", view, nil, [self iosurface], [self iosurfacePlane], __builtin_return_address(0));
+	return view;
 }
 
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels
     slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swizzle
 {
-	return [self akViewWithPixelFormat:format type:type levels:levels slices:slices swizzle:&swizzle];
+	id<MTLTexture> view = [self akViewWithPixelFormat:format type:type levels:levels slices:slices swizzle:&swizzle];
+
+	akios_texture_note("view", view, nil, [self iosurface], [self iosurfacePlane], __builtin_return_address(0));
+	return view;
 }
 
 - (BOOL)akWrap:(hakios_metal_device *)core layout:(const struct hakios_metal_texture_layout *)layout
@@ -225,6 +234,14 @@ akios_layered(unsigned type)
  */
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
+	id<MTLTexture> texture = [self akNewTextureWithDescriptor:descriptor];
+
+	akios_texture_note("plain", texture, descriptor, NULL, 0, __builtin_return_address(0));
+	return texture;
+}
+
+- (id<MTLTexture>)akNewTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+{
 	hakios_metal_device *core = [self akCore];
 	struct hakios_metal_texture_layout layout;
 
@@ -285,6 +302,34 @@ akios_layered(unsigned type)
 }
 
 /*
+ * What a process makes textures over (11-26): the first 24 IOSurface textures a process asks for, one line each -- the
+ * surface, its fourcc, the format asked and served, size, rows, usage, storage. backboardd aborted in CoreAnimation's
+ * push_surface right after making one (an asynchronous layer's surface, on the unlock); the line says which.
+ */
+static void
+akm_surface_shape(IOSurfaceRef surface, NSUInteger plane, OSType fourcc, unsigned asked, unsigned served, NSUInteger width,
+    NSUInteger height, size_t rows, MTLTextureUsage usage, MTLStorageMode storage)
+{
+	static unsigned said;
+
+	if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) >= 24) {
+		return;
+	}
+	char cc[5] = { (char)(fourcc >> 24), (char)(fourcc >> 16), (char)(fourcc >> 8), (char)fourcc, 0 };
+	for (int i = 0; i < 4; i++) {
+		if (cc[i] < 32 || cc[i] > 126) cc[i] = '?';
+	}
+	char as[32] = "";
+	if (served != asked) {
+		snprintf(as, sizeof(as), " (served as %u)", served);
+	}
+	akios_say("a texture over IOSurface %u plane %lu ('%s', %zux%zu, rows of %zu bytes): MTLPixelFormat %u%s, %lux%lu, "
+	    "usage %#lx, storage %lu\n", IOSurfaceGetID(surface), (unsigned long)plane, cc, IOSurfaceGetWidth(surface),
+	    IOSurfaceGetHeight(surface), rows, asked, as, (unsigned long)width, (unsigned long)height, (unsigned long)usage,
+	    (unsigned long)storage);
+}
+
+/*
  * A texture over an IOSurface plane (plan 1.6, 2.2): IOGPU's resource of kind 0x82 (the kernel answers the plane's GPU
  * address), the core's texture over its rows -- the surface's own rows, which the Mali samples only from 64-byte
  * multiples (MiniIOSurface aligns them so by default); others, and the two-plane YCbCr formats, are refused by name for
@@ -293,6 +338,14 @@ akios_layered(unsigned type)
  */
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
 {
+	id<MTLTexture> texture = [self akNewTextureWithDescriptor:descriptor iosurface:surface plane:plane];
+
+	akios_texture_note("iosurface", texture, descriptor, surface, plane, __builtin_return_address(0));
+	return texture;
+}
+
+- (id<MTLTexture>)akNewTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
+{
 	hakios_metal_device *core = [self akCore];
 
 	if (core == NULL || descriptor == nil || surface == NULL) {
@@ -300,8 +353,9 @@ akios_layered(unsigned type)
 		return nil;
 	}
 	const size_t planes = IOSurfaceGetPlaneCount(surface);
+	const BOOL xrOverBGRA = descriptor.pixelFormat >= 552 && descriptor.pixelFormat <= 555 && IOSurfaceGetPixelFormat(surface) == 'BGRA';
 	if ((planes == 0 && plane != 0) || (planes != 0 && plane >= planes) || descriptor.textureType != MTLTextureType2D ||
-	    descriptor.pixelFormat >= 500) {
+	    (descriptor.pixelFormat >= 500 && !xrOverBGRA)) {
 		akios_say("refused: a texture of type %lu, pixel format %lu over plane %lu of IOSurface %u (%zu planes): 2D, one plane of a "
 		    "colour format is served\n", (unsigned long)descriptor.textureType, (unsigned long)descriptor.pixelFormat,
 		    (unsigned long)plane, IOSurfaceGetID(surface), planes);
@@ -310,11 +364,23 @@ akios_layered(unsigned type)
 	const size_t rows = planes != 0 ? IOSurfaceGetBytesPerRowOfPlane(surface, plane) : IOSurfaceGetBytesPerRow(surface);
 	const size_t height = planes != 0 ? IOSurfaceGetHeightOfPlane(surface, plane) : IOSurfaceGetHeight(surface);
 	void *cpu = planes != 0 ? IOSurfaceGetBaseAddressOfPlane(surface, plane) : IOSurfaceGetBaseAddress(surface);
+	const OSType fourcc = IOSurfaceGetPixelFormat(surface);
 	MTLTextureUsage usage = descriptor.usage & ~(MTLTextureUsage)MTLTextureUsagePixelFormatView & (MTLTextureUsage)0xffff;
+	unsigned format = (unsigned)descriptor.pixelFormat;
 
 	if (usage == MTLTextureUsageUnknown) {
 		usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
 	}
+	/*
+	 * The extended-range formats over a surface of 8-bit BGRA (as the earlier core did, 11-23): BGRA10_XR / BGR10_XR and
+	 * their sRGB twins (552..555) asked of a 'BGRA' surface -- SpringBoard's lock-screen hello asks it of backboardd's
+	 * capture -- read the surface as what it holds, BGRA8 (80 / 81). IOGPU's texture keeps the format asked.
+	 */
+	if (format >= 552 && format <= 555 && fourcc == 'BGRA') {
+		format = (format & 1) ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
+	}
+	akm_surface_shape(surface, plane, fourcc, (unsigned)descriptor.pixelFormat, format, descriptor.width, descriptor.height,
+	    rows, usage, descriptor.storageMode);
 	uint8_t args[AKIOS_RESOURCE_ARGS_SIZE] = { 0 };
 	AkiosMaliTexture *texture = [[AkiosMaliTexture alloc] initWithDevice:self descriptor:descriptor iosurface:surface plane:plane field:0
 	    args:args argsSize:sizeof(args)];
@@ -322,7 +388,7 @@ akios_layered(unsigned type)
 		akios_say("refused: a texture over IOSurface %u: IOGPU made no resource of it\n", IOSurfaceGetID(surface));
 		return nil;
 	}
-	hakios_metal_texture *t = hakios_metal_texture_wrap_rows(core, (unsigned)descriptor.pixelFormat, (unsigned)descriptor.width,
+	hakios_metal_texture *t = hakios_metal_texture_wrap_rows(core, format, (unsigned)descriptor.width,
 	    (unsigned)descriptor.height, (unsigned)usage, [texture gpuAddress], cpu, (uint64_t)rows * height, (uint32_t)rows);
 	if (t == NULL) {
 		akios_say("refused: a texture over IOSurface %u plane %lu: %s\n", IOSurfaceGetID(surface), (unsigned long)plane, hakios_metal_error());
@@ -340,6 +406,14 @@ akios_layered(unsigned type)
 @implementation AkiosMaliBuffer (Textures)
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bytesPerRow
+{
+	id<MTLTexture> texture = [self akNewTextureWithDescriptor:descriptor offset:offset bytesPerRow:bytesPerRow];
+
+	akios_texture_note("buffer", texture, descriptor, NULL, 0, __builtin_return_address(0));
+	return texture;
+}
+
+- (id<MTLTexture>)akNewTextureWithDescriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bytesPerRow
 {
 	hakios_metal_buffer *core = [self akCore];
 
