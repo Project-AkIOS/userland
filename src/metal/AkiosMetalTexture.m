@@ -15,6 +15,92 @@ akios_layered(unsigned type)
 
 @implementation AkiosMaliTexture {
 	hakios_metal_texture *_akCore;
+	MTLTextureUsage _akUsage;       /* the usage it was made with (0: IOGPU's answer) */
+}
+
+/*
+ * THE USAGE (11-26): IOGPUMetalTexture's IOSurface initialiser answers -usage 0 whatever the descriptor said (D1 on the
+ * phone: a render target refused as "made with usage 0"), so the usage the texture was made with is kept here and
+ * answered; the core's texture carries the same bits.
+ */
+- (void)akSetUsage:(MTLTextureUsage)usage
+{
+	_akUsage = usage;
+}
+
+- (MTLTextureUsage)usage
+{
+	return _akUsage != 0 ? _akUsage : [super usage];
+}
+
+/* -[MTLRenderPassColorAttachmentDescriptorInternal setTexture:] asserts conformance to MTLTextureImplementation */
++ (void)load
+{
+	Protocol *impl = objc_getProtocol("MTLTextureImplementation");
+
+	if (impl != NULL && !class_conformsToProtocol(self, impl)) {
+		class_addProtocol(self, impl);
+	}
+}
+
+- (void)akSetCore:(hakios_metal_texture *)core
+{
+	_akCore = core;
+}
+
+/* --- views (plan 1.6): IOGPU's view of the same resource, the core's view of the same memory --- */
+
+- (id<MTLTexture>)akViewWithPixelFormat:(MTLPixelFormat)format type:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices
+    swizzle:(const MTLTextureSwizzleChannels *)swizzle
+{
+	hakios_metal_texture *view = hakios_metal_texture_new_view(_akCore, (unsigned)format, (unsigned)type, (unsigned)levels.location,
+	    (unsigned)levels.length, (unsigned)slices.location, (unsigned)slices.length);
+	const BOOL turned = swizzle != NULL && !(swizzle->red == MTLTextureSwizzleRed && swizzle->green == MTLTextureSwizzleGreen &&
+	    swizzle->blue == MTLTextureSwizzleBlue && swizzle->alpha == MTLTextureSwizzleAlpha);
+
+	if (view != NULL && turned) {
+		hakios_metal_texture *swizzled = hakios_metal_texture_new_swizzled(view, swizzle->red, swizzle->green, swizzle->blue,
+		    swizzle->alpha);
+
+		hakios_metal_texture_free(view);
+		view = swizzled;
+	}
+	if (view == NULL) {
+		akios_say("refused: a texture view of pixel format %lu, type %lu, levels %lu+%lu, slices %lu+%lu: %s\n", (unsigned long)format,
+		    (unsigned long)type, (unsigned long)levels.location, (unsigned long)levels.length, (unsigned long)slices.location,
+		    (unsigned long)slices.length, hakios_metal_error());
+		return nil;
+	}
+	AkiosMaliTexture *made = swizzle != NULL ?
+	    [[AkiosMaliTexture alloc] initWithTexture:self pixelFormat:format textureType:type levels:levels slices:slices swizzle:*swizzle] :
+	    [[AkiosMaliTexture alloc] initWithTexture:self pixelFormat:format textureType:type levels:levels slices:slices];
+	if (made == nil) {
+		hakios_metal_texture_free(view);
+		return nil;
+	}
+	[made akSetCore:view];
+	[made akSetUsage:[self usage]];
+	return (id<MTLTexture>)made;
+}
+
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format
+{
+	const NSUInteger slices = [self textureType] == MTLTextureType3D ? 1 : MAX(hakios_metal_texture_depth(_akCore), 1u);
+
+	return [self akViewWithPixelFormat:format type:[self textureType] levels:NSMakeRange(0, [self mipmapLevelCount])
+	    slices:NSMakeRange(0, akios_layered((unsigned)[self textureType]) ? slices : 1) swizzle:NULL];
+}
+
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels
+    slices:(NSRange)slices
+{
+	return [self akViewWithPixelFormat:format type:type levels:levels slices:slices swizzle:NULL];
+}
+
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels
+    slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swizzle
+{
+	return [self akViewWithPixelFormat:format type:type levels:levels slices:slices swizzle:&swizzle];
 }
 
 - (BOOL)akWrap:(hakios_metal_device *)core layout:(const struct hakios_metal_texture_layout *)layout
@@ -191,6 +277,56 @@ akios_layered(unsigned type)
 	if (descriptor.storageMode == MTLStorageModeMemoryless) {
 		hakios_metal_texture_set_memoryless([texture akCore], 1);
 	}
+	[texture akSetUsage:usage];
+	return (id<MTLTexture>)texture;
+}
+
+/*
+ * A texture over an IOSurface plane (plan 1.6, 2.2): IOGPU's resource of kind 0x82 (the kernel answers the plane's GPU
+ * address), the core's texture over its rows -- the surface's own rows, which the Mali samples only from 64-byte
+ * multiples (MiniIOSurface aligns them so by default); others, and the two-plane YCbCr formats, are refused by name for
+ * now (the earlier plug-in's mirrors and shadow copies did not come along). The CPU paths (-replaceRegion:...) go
+ * through this process's mapping of the surface.
+ */
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
+{
+	hakios_metal_device *core = [self akCore];
+
+	if (core == NULL || descriptor == nil || surface == NULL) {
+		akios_say("refused: a texture over an IOSurface: %s\n", core == NULL ? "no Mali core on this device" : "no descriptor or surface");
+		return nil;
+	}
+	const size_t planes = IOSurfaceGetPlaneCount(surface);
+	if ((planes == 0 && plane != 0) || (planes != 0 && plane >= planes) || descriptor.textureType != MTLTextureType2D ||
+	    descriptor.pixelFormat >= 500) {
+		akios_say("refused: a texture of type %lu, pixel format %lu over plane %lu of IOSurface %u (%zu planes): 2D, one plane of a "
+		    "colour format is served\n", (unsigned long)descriptor.textureType, (unsigned long)descriptor.pixelFormat,
+		    (unsigned long)plane, IOSurfaceGetID(surface), planes);
+		return nil;
+	}
+	const size_t rows = planes != 0 ? IOSurfaceGetBytesPerRowOfPlane(surface, plane) : IOSurfaceGetBytesPerRow(surface);
+	const size_t height = planes != 0 ? IOSurfaceGetHeightOfPlane(surface, plane) : IOSurfaceGetHeight(surface);
+	void *cpu = planes != 0 ? IOSurfaceGetBaseAddressOfPlane(surface, plane) : IOSurfaceGetBaseAddress(surface);
+	MTLTextureUsage usage = descriptor.usage & ~(MTLTextureUsage)MTLTextureUsagePixelFormatView & (MTLTextureUsage)0xffff;
+
+	if (usage == MTLTextureUsageUnknown) {
+		usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+	}
+	uint8_t args[AKIOS_RESOURCE_ARGS_SIZE] = { 0 };
+	AkiosMaliTexture *texture = [[AkiosMaliTexture alloc] initWithDevice:self descriptor:descriptor iosurface:surface plane:plane field:0
+	    args:args argsSize:sizeof(args)];
+	if (texture == nil || [texture gpuAddress] == 0) {
+		akios_say("refused: a texture over IOSurface %u: IOGPU made no resource of it\n", IOSurfaceGetID(surface));
+		return nil;
+	}
+	hakios_metal_texture *t = hakios_metal_texture_wrap_rows(core, (unsigned)descriptor.pixelFormat, (unsigned)descriptor.width,
+	    (unsigned)descriptor.height, (unsigned)usage, [texture gpuAddress], cpu, (uint64_t)rows * height, (uint32_t)rows);
+	if (t == NULL) {
+		akios_say("refused: a texture over IOSurface %u plane %lu: %s\n", IOSurfaceGetID(surface), (unsigned long)plane, hakios_metal_error());
+		return nil;
+	}
+	[texture akSetCore:t];
+	[texture akSetUsage:usage];
 	return (id<MTLTexture>)texture;
 }
 

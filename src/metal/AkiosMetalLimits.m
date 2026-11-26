@@ -86,6 +86,20 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 	return 64;
 }
 
+/*
+ * The linear and IOSurface texture alignments _mtlValidateStrideTextureParameters checks a texture's rows and start
+ * against (Metal 1a567a970: IOGPUMetalTexture's IOSurface and buffer initialisers call it). _MTLDevice answers each
+ * from its limits table (+0xa0..+0xb0, +4, +8), which the profiles left 0 here, and the validation then asserted
+ * "bytesPerRow (256) must be aligned to 0 bytes". The Mali reads linear rows from 64-byte multiples, read-only or not.
+ */
+- (NSUInteger)linearTextureAlignmentBytes { return 64; }
+- (NSUInteger)deviceLinearTextureAlignmentBytes { return 64; }
+- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes { return 64; }
+- (NSUInteger)iosurfaceTextureAlignmentBytes { return 64; }
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes { return 64; }
+- (NSUInteger)linearTextureArrayAlignmentBytes { return 64; }
+- (NSUInteger)linearTextureArrayAlignmentSlice { return 64; }
+
 /* _MTLDevice's own answer is a NULL its caller dereferences: a real struct, named after the GPU (Metal then looks for a
  * pipelines.Mali-G715 library, finds none, and carries on) */
 - (const struct MTLTargetDeviceArch *)targetDeviceInfo

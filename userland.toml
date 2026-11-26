@@ -93,20 +93,20 @@ plist = "src/audio/Info.plist"
 out = "akita/lib/AkiosMetal.bundle/AkiosMetal"
 kind = "bundle"
 src = ["src/metal/AkiosMetal.m", "src/metal/AkiosMetalTexture.m", "src/metal/AkiosMetalEncoders.m", "src/metal/AkiosMetalState.m",
-       "src/metal/AkiosMetalLimits.m"]
+       "src/metal/AkiosMetalLimits.m", "src/metal/AkiosMetalRender.m", "src/metal/AkiosMetalPipelines.m", "src/metal/AkiosMetalHeap.m"]
 flags = ["-fobjc-arc", "-F@sdk/System/Library/PrivateFrameworks", "-framework", "IOGPU", "-I@metal/include",
          "@metal/out/ios-mali-arm64e/libhakios-metal.a"]
-frameworks = ["Foundation", "IOKit", "Metal"]
+frameworks = ["Foundation", "IOKit", "IOSurface", "Metal"]
 libs = ["objc", "c++", "z"]
 plist = "src/metal/Info.plist"
 make = ["make", "-C", "@metal", "ios-mali", "ARCH=arm64e", "HAKIOS=@legacy"]
 
-# (its step C kernels: the .metallib of the Metal tree's tools/kernels, metal_kernels_lib.h in the old userland)
+# (its kernels and draw functions: the Metal tree's tools/kernels, as metal_kernels_lib.h and mali_draw_bc.h of the old userland)
 [[build]]
 out = "akita/bin/akios_metal_test"
 src = ["src/tools/akios_metal_test.m"]
 flags = ["-fobjc-arc", "-I@metal_plugin"]
-frameworks = ["Foundation", "IOKit", "Metal"]
+frameworks = ["Foundation", "IOKit", "IOSurface", "Metal"]
 libs = ["objc"]
 
 # Metal's plug-in for CoreAnimation over the Mali back end: still built from the old tree (its own repository later);

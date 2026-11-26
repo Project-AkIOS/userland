@@ -13,6 +13,14 @@
  *   C4. 40 command buffers, each filling its own slot: completed in commit order, every slot right
  *   C5. a fill at an address nothing maps (HAKIOS_MALI_FAULT_TEST while it is encoded): the command buffer ends
  *       in error, and C6 the next one completes (the device and the queue keep working)
+ *   D1. a triangle (tri_color_vs/fs: red, green, blue corners) into a texture over an IOSurface, read with IOSurfaceLock:
+ *       the top-left pixel blue, bottom-left red, bottom-right green, top-right the clear colour (orientation top-left)
+ *   D2. the other half drawn by a pass that loads (the first half kept); then a pass that only clears (all white)
+ *   D3. depth: a full-screen quad at z 0 against a depth cleared to 0 (Less: nothing drawn), then to 1 (all drawn)
+ *   D4. 4x MSAA into a multisample texture, resolved into a plain one at the end of the pass
+ *   D5. a heap: a texture from it written by a kernel, a buffer from it filled by a blit
+ *   D6. a texture view with a swizzle (red and blue swapped) sampled by tex_sample_gid
+ *   D7. CoreAnimation's std_vert1_lph + inplace_copy_lph from QuartzCore's default.metallib made a pipeline
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -23,7 +31,72 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <IOSurface/IOSurfaceRef.h>
+
 #include "metal_kernels_lib.h"   /* (hakios-base userland/src: fill_id, tg_arg, pvt_fill, tex_fill, tex_copy, tex_sample_gid) */
+#include "mali_draw_bc.h"        /* (... and tri_color_vs/fs's bitcode: hakios-metal tools/kernels/tri_color_*.ll) */
+
+/* A .metallib of a vertex and a fragment function from their bitcode: the container hakios-metal's
+ * tools/mesa/pan/mk-metallib.py writes (its layout only; nothing of Apple's), with each function's TYPE (0 vertex,
+ * 1 fragment) */
+static NSData *
+render_library(void)
+{
+	const struct { const char *name; unsigned char type; const unsigned char *bc; unsigned len; } fn[2] = {
+		{ "tri_color_vs", 0, tri_color_vs_bc, tri_color_vs_bc_len },
+		{ "tri_color_fs", 1, tri_color_fs_bc, tri_color_fs_bc_len },
+	};
+	NSMutableData *entries = [NSMutableData data], *modules = [NSMutableData data];
+	for (int i = 0; i < 2; i++) {
+		NSMutableData *e = [NSMutableData data];
+		void (^tag)(const char *, const void *, uint16_t) = ^(const char *t, const void *v, uint16_t n) {
+			[e appendBytes:t length:4];
+			[e appendBytes:&n length:2];
+			[e appendBytes:v length:n];
+		};
+		const uint16_t vers[4] = { 2, 8, 4, 0 };
+		const uint64_t offt[3] = { 0, 0, modules.length }, mdsz = fn[i].len;
+		tag("NAME", fn[i].name, (uint16_t)(strlen(fn[i].name) + 1));
+		tag("TYPE", &fn[i].type, 1);
+		tag("VERS", vers, sizeof(vers));
+		tag("OFFT", offt, sizeof(offt));
+		tag("MDSZ", &mdsz, sizeof(mdsz));
+		[e appendBytes:"ENDT" length:4];
+		uint32_t len = (uint32_t)e.length + 4;
+		[entries appendBytes:&len length:4];
+		[entries appendData:e];
+		[modules appendBytes:fn[i].bc length:fn[i].len];
+	}
+	uint8_t head[0x58] = { 'M', 'T', 'L', 'B' };
+	const uint16_t v[2] = { 32769, 2 };
+	const uint32_t count = 2;
+	const uint64_t listAt = sizeof(head), listLen = 4 + entries.length, modulesAt = listAt + listLen;
+	const uint64_t total = modulesAt + modules.length, listCount = listLen - 4, modulesLen = modules.length;
+	memcpy(head + 4, v, 4);
+	memcpy(head + 0x10, &total, 8);
+	memcpy(head + 0x18, &listAt, 8);
+	memcpy(head + 0x20, &listCount, 8);
+	memcpy(head + 0x48, &modulesAt, 8);
+	memcpy(head + 0x50, &modulesLen, 8);
+	NSMutableData *lib = [NSMutableData dataWithBytes:head length:sizeof(head)];
+	[lib appendBytes:&count length:4];
+	[lib appendData:entries];
+	[lib appendData:modules];
+	return lib;
+}
+
+/* the dominant channel of a BGRA pixel: 'r', 'g', 'b', 'k' (dark), 'w' (white) or '?' */
+static char
+dominant(const uint8_t *p)
+{
+	const unsigned b = p[0], g = p[1], r = p[2];
+	if (r > 200 && g > 200 && b > 200) return 'w';
+	if (r < 40 && g < 40 && b < 40) return 'k';
+	if (r > g + 60 && r > b + 60) return 'r';
+	if (g > r + 60 && g > b + 60) return 'g';
+	if (b > r + 60 && b > g + 60) return 'b';
+	return '?';
+}
 
 static const char *
 cb_error(id<MTLCommandBuffer> cb)
@@ -429,6 +502,278 @@ main(int argc, char **argv)
 				return 18;
 			}
 		}
+
+		/* ---- D: rendering ---- */
+		const unsigned RW = 64, RH = 64;
+		NSData *rlib = render_library();
+		id<MTLLibrary> rl = [dev newLibraryWithData:dispatch_data_create(rlib.bytes, rlib.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT)
+		    error:&error];
+		id<MTLFunction> vsf = [rl newFunctionWithName:@"tri_color_vs"], fsf = [rl newFunctionWithName:@"tri_color_fs"];
+		MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+		rpd.vertexFunction = vsf;
+		rpd.fragmentFunction = fsf;
+		rpd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		id<MTLRenderPipelineState> tri = vsf && fsf ? [dev newRenderPipelineStateWithDescriptor:rpd error:&error] : nil;
+		printf("D0: render library %s, functions %s %s, pipeline %s%s%s\n", rl ? "made" : "nil", vsf ? "found" : "nil", fsf ? "found" : "nil",
+		    tri ? object_getClassName(tri) : "nil", error ? ": " : "", error ? error.localizedDescription.UTF8String : "");
+		if (tri == nil) {
+			return 19;
+		}
+		NSDictionary *sprops = @{ (id)kIOSurfaceWidth: @(RW), (id)kIOSurfaceHeight: @(RH), (id)kIOSurfaceBytesPerElement: @4,
+		    (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA') };
+		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)sprops);
+		MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:RW height:RH
+		    mipmapped:NO];
+		sd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		id<MTLTexture> st = surface ? [dev newTextureWithDescriptor:sd iosurface:surface plane:0] : nil;
+		printf("D1: IOSurface %u (rows %zu), texture %s\n", surface ? IOSurfaceGetID(surface) : 0, surface ? IOSurfaceGetBytesPerRow(surface) : 0,
+		    st ? object_getClassName(st) : "nil");
+		if (st == nil) {
+			return 20;
+		}
+		/* one pass: LOAD action, clear colour, the vertices FIRST .. FIRST + 2 (or none) */
+		id<MTLCommandBuffer> (^pass)(id<MTLTexture>, MTLLoadAction, MTLClearColor, int) =
+		    ^id<MTLCommandBuffer>(id<MTLTexture> target, MTLLoadAction load, MTLClearColor clear, int first) {
+			MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+			d.colorAttachments[0].texture = target;
+			d.colorAttachments[0].loadAction = load;
+			d.colorAttachments[0].storeAction = MTLStoreActionStore;
+			d.colorAttachments[0].clearColor = clear;
+			id<MTLCommandBuffer> cb = [q commandBuffer];
+			id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:d];
+			if (first >= 0) {
+				[re setRenderPipelineState:tri];
+				[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:(NSUInteger)first vertexCount:3];
+			}
+			[re endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			return cb;
+		};
+		char (^at)(unsigned, unsigned) = ^char(unsigned x, unsigned y) {
+			IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+			const uint8_t *p = (const uint8_t *)IOSurfaceGetBaseAddress(surface) + IOSurfaceGetBytesPerRow(surface) * y + 4 * x;
+			char c = dominant(p);
+			IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+			return c;
+		};
+		id<MTLCommandBuffer> d1 = pass(st, MTLLoadActionClear, MTLClearColorMake(0, 0, 0, 1), 0);
+		/* (pixel (x, y) is NDC (2 (x + 0.5) / W - 1, 1 - 2 (y + 0.5) / H); the triangle is x + y <= 0 there, so every probe is
+		 * kept well off that diagonal: top-left (2, 12) -> (-0.92, 0.61), bottom-left (2, 61) -> (-0.92, -0.92), bottom-right
+		 * (54, 61) -> (0.70, -0.92), top-right (61, 2) -> (0.92, 0.92), outside) */
+		printf("D1: tri_color_vs's first triangle: (-1, -1) red, (1, -1) green, (-1, 1) blue; the second (1, -1) red, (1, 1) green, "
+		    "(-1, 1) blue; z 0\n");
+		char tl = at(2, 12), bl = at(2, RH - 3), br = at(RW - 10, RH - 3), tr = at(RW - 3, 2);
+		printf("D1: triangle: status %ld (%s); top-left %c (b), bottom-left %c (r), bottom-right %c (g), top-right %c (k)\n",
+		    (long)d1.status, cb_error(d1), tl, bl, br, tr);
+		if (d1.status != MTLCommandBufferStatusCompleted || tl != 'b' || bl != 'r' || br != 'g' || tr != 'k') {
+			return 21;
+		}
+		id<MTLCommandBuffer> d2 = pass(st, MTLLoadActionLoad, MTLClearColorMake(1, 1, 1, 1), 3);
+		char tl2 = at(2, 12), tr2 = at(RW - 3, 2);
+		id<MTLCommandBuffer> d2c = pass(st, MTLLoadActionClear, MTLClearColorMake(1, 1, 1, 1), -1);
+		char w1 = at(2, 2), w2 = at(RW - 3, RH - 3);
+		printf("D2: load: status %ld (%s), top-left %c (b: kept), top-right %c (g: drawn); clear only: status %ld, %c %c (w w)\n",
+		    (long)d2.status, cb_error(d2), tl2, tr2, (long)d2c.status, w1, w2);
+		if (d2.status != MTLCommandBufferStatusCompleted || tl2 != 'b' || tr2 != 'g' || d2c.status != MTLCommandBufferStatusCompleted ||
+		    w1 != 'w' || w2 != 'w') {
+			return 22;
+		}
+
+		/* D3: depth */
+		{
+			MTLRenderPipelineDescriptor *zd = [rpd copy];
+			zd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+			id<MTLRenderPipelineState> zp = [dev newRenderPipelineStateWithDescriptor:zd error:&error];
+			MTLTextureDescriptor *ztd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:RW
+			    height:RH mipmapped:NO];
+			ztd.usage = MTLTextureUsageRenderTarget;
+			ztd.storageMode = MTLStorageModePrivate;
+			id<MTLTexture> zt = [dev newTextureWithDescriptor:ztd];
+			MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
+			dsd.depthCompareFunction = MTLCompareFunctionLess;
+			dsd.depthWriteEnabled = YES;
+			id<MTLDepthStencilState> less = [dev newDepthStencilStateWithDescriptor:dsd];
+			if (zp == nil || zt == nil || less == nil) {
+				printf("D3: depth pipeline %s, texture %s, state %s (%s)\n", zp ? "made" : "nil", zt ? "made" : "nil", less ? "made" : "nil",
+				    error ? error.localizedDescription.UTF8String : "");
+				return 23;
+			}
+			char got[2];
+			long status[2];
+			for (int k = 0; k < 2; k++) {
+				MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+				d.colorAttachments[0].texture = st;
+				d.colorAttachments[0].loadAction = MTLLoadActionClear;
+				d.colorAttachments[0].storeAction = MTLStoreActionStore;
+				d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+				d.depthAttachment.texture = zt;
+				d.depthAttachment.loadAction = MTLLoadActionClear;
+				d.depthAttachment.storeAction = MTLStoreActionDontCare;
+				d.depthAttachment.clearDepth = k == 0 ? 0.0 : 1.0;
+				id<MTLCommandBuffer> cb = [q commandBuffer];
+				id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:d];
+				[re setRenderPipelineState:zp];
+				[re setDepthStencilState:less];
+				[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+				[re endEncoding];
+				[cb commit];
+				[cb waitUntilCompleted];
+				status[k] = (long)cb.status;
+				got[k] = at(2, 12);
+			}
+			printf("D3: depth Less at z 0: cleared to 0 -> %c (k), cleared to 1 -> %c (b); status %ld %ld\n", got[0], got[1], status[0], status[1]);
+			if (got[0] != 'k' || got[1] != 'b' || status[0] != MTLCommandBufferStatusCompleted || status[1] != MTLCommandBufferStatusCompleted) {
+				return 23;
+			}
+		}
+
+		/* D4: 4x MSAA and its resolve */
+		{
+			MTLRenderPipelineDescriptor *md = [rpd copy];
+			md.rasterSampleCount = 4;
+			id<MTLRenderPipelineState> mp = [dev newRenderPipelineStateWithDescriptor:md error:&error];
+			MTLTextureDescriptor *msd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:RW height:RH
+			    mipmapped:NO];
+			msd.textureType = MTLTextureType2DMultisample;
+			msd.sampleCount = 4;
+			msd.usage = MTLTextureUsageRenderTarget;
+			msd.storageMode = MTLStorageModePrivate;
+			id<MTLTexture> ms = [dev newTextureWithDescriptor:msd];
+			MTLTextureDescriptor *rsd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:RW height:RH
+			    mipmapped:NO];
+			rsd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			id<MTLTexture> resolved = [dev newTextureWithDescriptor:rsd];
+			if (mp == nil || ms == nil || resolved == nil) {
+				printf("D4: MSAA pipeline %s, textures %s %s (%s)\n", mp ? "made" : "nil", ms ? "made" : "nil", resolved ? "made" : "nil",
+				    error ? error.localizedDescription.UTF8String : "");
+				return 24;
+			}
+			MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+			d.colorAttachments[0].texture = ms;
+			d.colorAttachments[0].resolveTexture = resolved;
+			d.colorAttachments[0].loadAction = MTLLoadActionClear;
+			d.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+			d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+			id<MTLCommandBuffer> cb = [q commandBuffer];
+			id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:d];
+			[re setRenderPipelineState:mp];
+			[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			[re endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			uint8_t px[4 * RW * RH];
+			[resolved getBytes:px bytesPerRow:4 * RW fromRegion:MTLRegionMake2D(0, 0, RW, RH) mipmapLevel:0];
+			/* (on the diagonal from top-left to bottom-right a pixel half covered: neither the clear nor a corner's colour alone) */
+			const uint8_t *edge = px + 4 * (RW * 31 + 32);
+			char rtl = dominant(px + 4 * (RW * 12 + 2)), rtr = dominant(px + 4 * (RW * 2 + RW - 3));
+			printf("D4: MSAA resolve: status %ld (%s); top-left %c (b), top-right %c (k), on the edge BGRA %u %u %u %u\n", (long)cb.status,
+			    cb_error(cb), rtl, rtr, edge[0], edge[1], edge[2], edge[3]);
+			if (cb.status != MTLCommandBufferStatusCompleted || rtl != 'b' || rtr != 'k') {
+				return 24;
+			}
+		}
+
+		/* D5: a heap's texture written by a kernel, its buffer filled by a blit */
+		{
+			MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+			hd.size = 1 << 20;
+			hd.storageMode = MTLStorageModeShared;
+			id<MTLHeap> heap = [dev newHeapWithDescriptor:hd];
+			MTLTextureDescriptor *htd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Uint width:16 height:16
+			    mipmapped:NO];
+			htd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+			htd.storageMode = MTLStorageModeShared;
+			id<MTLTexture> ht = [heap newTextureWithDescriptor:htd];
+			id<MTLBuffer> hb = [heap newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+			id<MTLComputePipelineState> fp = [dev newComputePipelineStateWithFunction:[library newFunctionWithName:@"tex_fill"] error:&error];
+			if (heap == nil || ht == nil || hb == nil || fp == nil) {
+				printf("D5: heap %s, texture %s, buffer %s, pipeline %s\n", heap ? object_getClassName(heap) : "nil", ht ? "made" : "nil",
+				    hb ? "made" : "nil", fp ? "made" : "nil");
+				return 25;
+			}
+			uint32_t c5 = 0x55;
+			id<MTLCommandBuffer> cb = [q commandBuffer];
+			id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+			[ce setComputePipelineState:fp];
+			[ce setTexture:ht atIndex:0];
+			[ce setBytes:&c5 length:4 atIndex:0];
+			[ce dispatchThreads:MTLSizeMake(16, 16, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+			[ce endEncoding];
+			id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+			[be fillBuffer:hb range:NSMakeRange(0, 4096) value:0x5e];
+			[be endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			uint32_t back[16 * 16 * 4];
+			[ht getBytes:back bytesPerRow:16 * 16 fromRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0];
+			unsigned right = 0, filled = 0;
+			for (uint32_t i = 0; i < 256; i++) right += back[4 * i] == i * 0x9E3779B1u + 0x55u && back[4 * i + 3] == 0xdead;
+			for (int k = 0; k < 4096; k++) filled += ((uint8_t *)hb.contents)[k] == 0x5e;
+			printf("D5: heap: status %ld (%s), texture %u of 256 texels right, buffer %u of 4096 bytes filled, used %lu of %lu\n",
+			    (long)cb.status, cb_error(cb), right, filled, (unsigned long)heap.usedSize, (unsigned long)heap.size);
+			if (cb.status != MTLCommandBufferStatusCompleted || right != 256 || filled != 4096) {
+				return 25;
+			}
+		}
+
+		/* D6: a swizzled view (red <-> blue) of an RGBA8 texture, sampled */
+		{
+			MTLTextureDescriptor *u8 = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:16 height:16
+			    mipmapped:NO];
+			u8.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+			id<MTLTexture> base = [dev newTextureWithDescriptor:u8];
+			uint8_t px[16 * 16 * 4];
+			for (int i = 0; i < 256; i++) px[4 * i] = 200, px[4 * i + 1] = 100, px[4 * i + 2] = 50, px[4 * i + 3] = 255;
+			[base replaceRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0 withBytes:px bytesPerRow:64];
+			id<MTLTexture> view = [base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D
+			    levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)
+			    swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen, MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+			id<MTLComputePipelineState> sp = [dev newComputePipelineStateWithFunction:[library newFunctionWithName:@"tex_sample_gid"] error:&error];
+			id<MTLSamplerState> nearest = [dev newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
+			id<MTLBuffer> out = [dev newBufferWithLength:256 * 16 options:MTLResourceStorageModeShared];
+			if (view == nil || sp == nil) {
+				printf("D6: view %s, pipeline %s\n", view ? object_getClassName(view) : "nil", sp ? "made" : "nil");
+				return 26;
+			}
+			id<MTLCommandBuffer> cb = [q commandBuffer];
+			id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+			[ce setComputePipelineState:sp];
+			[ce setTexture:view atIndex:0];
+			[ce setSamplerState:nearest atIndex:0];
+			[ce setBuffer:out offset:0 atIndex:0];
+			[ce dispatchThreads:MTLSizeMake(16, 16, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+			[ce endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			const float *f = out.contents;
+			printf("D6: swizzled view: status %ld (%s), texel 0 reads %.3f %.3f %.3f %.3f (0.196 0.392 0.784 1 expected)\n", (long)cb.status,
+			    cb_error(cb), f[0], f[1], f[2], f[3]);
+			if (cb.status != MTLCommandBufferStatusCompleted || f[0] > 0.21f || f[0] < 0.18f || f[2] < 0.77f || f[2] > 0.80f) {
+				return 26;
+			}
+		}
+
+		/* D7: one of CoreAnimation's pipelines */
+		{
+			id<MTLLibrary> ca = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"/akita/share/ca-share/QuartzCore-default.metallib"]
+			    error:&error];
+			MTLRenderPipelineDescriptor *cd = [MTLRenderPipelineDescriptor new];
+			cd.label = @"akios_metal_test.inplace_copy";
+			cd.vertexFunction = [ca newFunctionWithName:@"std_vert1_lph"];
+			cd.fragmentFunction = [ca newFunctionWithName:@"inplace_copy_lph"];
+			cd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+			NSDate *t0 = [NSDate date];
+			id<MTLRenderPipelineState> cp = cd.vertexFunction && cd.fragmentFunction ? [dev newRenderPipelineStateWithDescriptor:cd
+			    error:&error] : nil;
+			printf("D7: QuartzCore's library %s, std_vert1_lph + inplace_copy_lph: pipeline %s in %.0f ms%s%s\n", ca ? "opened" : "nil",
+			    cp ? object_getClassName(cp) : "nil", -[t0 timeIntervalSinceNow] * 1000, error && !cp ? ": " : "",
+			    error && !cp ? error.localizedDescription.UTF8String : "");
+			if (cp == nil) {
+				return 27;
+			}
+		}
+		CFRelease(surface);
 		printf("all steps passed\n");
 	}
 	return 0;

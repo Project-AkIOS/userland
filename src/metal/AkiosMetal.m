@@ -12,12 +12,16 @@
  *   AkiosMetalTexture.m    textures (the core's layout over IOGPU's texture resource)
  *   AkiosMetalEncoders.m   blit and compute encoders
  *   AkiosMetalState.m      samplers, compute pipelines
+ *   AkiosMetalRender.m     render passes, render and parallel render encoders, render pipeline states
+ *   AkiosMetalPipelines.m  render pipelines made, reflection, depth/stencil states, argument encoders
+ *   AkiosMetalHeap.m       heaps
  *   AkiosMetalLimits.m     the device's answers about itself (feature profile, target architecture, limits)
  */
 #import "AkiosMetal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <sys/sysctl.h>
 
 void
 akios_say(const char *format, ...)
@@ -29,6 +33,30 @@ akios_say(const char *format, ...)
 	vsnprintf(line, sizeof(line), format, ap);
 	va_end(ap);
 	fprintf(stderr, "AkiosMetal: %s: %s", getprogname(), line);
+}
+
+BOOL
+akios_boot_arg(const char *word)
+{
+	static char args[1024];
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		size_t size = sizeof(args) - 1;
+
+		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
+			args[0] = '\0';
+		}
+	});
+	return strstr(args, word) != NULL;
+}
+
+BOOL
+akios_strict(void)
+{
+	const char *env = getenv("AKIOS_METAL_STRICT");
+
+	return env != NULL ? strcmp(env, "1") == 0 : akios_boot_arg("metal_strict");
 }
 
 /* ---- the core's memory: IOGPU resources of this device (plan 2.1) ---- */
@@ -114,6 +142,7 @@ akios_memory_free(void *context, void *cookie)
 		akios_say("the Mali core could not be opened over IOGPU's connection 0x%x: %s; no encoders on this device\n", conn,
 		    conn != 0 ? hakios_metal_error() : "no connection");
 	}
+	akm_functions_encode_from_metadata();
 	return self;
 }
 
@@ -269,6 +298,10 @@ akios_memory_free(void *context, void *cookie)
 	hakios_metal_device *core = [(AkiosMaliDevice *)[queue device] akCore];
 
 	_akCore = core != NULL ? hakios_metal_cb_new_external(core) : NULL;
+	if (_akCore != NULL) {
+		/* (a refused piece of work left out, the rest run -- akios_strict) */
+		hakios_metal_cb_skip_refused(_akCore, !akios_strict());
+	}
 	_akHeld = [NSMutableArray new];
 	return self;
 }

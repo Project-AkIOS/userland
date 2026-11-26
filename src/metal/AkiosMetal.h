@@ -6,6 +6,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <objc/runtime.h>
 #include <stdbool.h>
 
@@ -40,6 +41,24 @@ extern io_connect_t IOGPUDeviceGetConnect(void *device);
 - (instancetype)initWithDevice:(id)device descriptor:(MTLTextureDescriptor *)descriptor sysMemSize:(NSUInteger)sysMemSize
     sysMemRowBytes:(NSUInteger)sysMemRowBytes vidMemSize:(NSUInteger)vidMemSize vidMemRowBytes:(NSUInteger)vidMemRowBytes
     args:(void *)args argsSize:(NSUInteger)argsSize;
+- (instancetype)initWithDevice:(id)device descriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface
+    plane:(NSUInteger)plane field:(NSUInteger)field args:(void *)args argsSize:(NSUInteger)argsSize;
+- (instancetype)initWithTexture:(id)texture pixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type
+    levels:(NSRange)levels slices:(NSRange)slices;
+- (instancetype)initWithTexture:(id)texture pixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type
+    levels:(NSRange)levels slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swizzle;
+/* (IOGPU's answers, from the descriptor) */
+- (NSUInteger)width;
+- (NSUInteger)height;
+- (NSUInteger)depth;
+- (NSUInteger)sampleCount;
+- (NSUInteger)arrayLength;
+- (NSUInteger)mipmapLevelCount;
+- (MTLPixelFormat)pixelFormat;
+- (MTLTextureType)textureType;
+- (MTLTextureUsage)usage;
+- (IOSurfaceRef)iosurface;
+- (NSUInteger)iosurfacePlane;
 @end
 
 @interface IOGPUMetalCommandQueue : NSObject
@@ -64,6 +83,20 @@ extern io_connect_t IOGPUDeviceGetConnect(void *device);
 @end
 
 @interface IOGPUMetalBlitCommandEncoder : IOGPUMetalCommandEncoder
+@end
+
+@interface IOGPUMetalRenderCommandEncoder : IOGPUMetalCommandEncoder
+/* (the base keeps nothing of the descriptor: 20d2e0a30) */
+- (instancetype)initWithCommandBuffer:(id)commandBuffer descriptor:(MTLRenderPassDescriptor *)descriptor;
+@end
+
+@interface IOGPUMetalParallelRenderCommandEncoder : IOGPUMetalCommandEncoder
+- (instancetype)initWithCommandBuffer:(id)commandBuffer renderPassDescriptor:(MTLRenderPassDescriptor *)descriptor;
+@end
+
+/* Metal's base of a render pipeline state (what AGX's sends to super; it asserts on a nil device or descriptor) */
+@interface _MTLRenderPipelineState : NSObject
+- (instancetype)initWithDevice:(id)device pipelineStateDescriptor:(id)descriptor;
 @end
 
 @interface IOGPUMetalComputeCommandEncoder : IOGPUMetalCommandEncoder
@@ -97,6 +130,23 @@ struct akios_cb_tail {
 #define AKIOS_MAX_SAMPLERS      16
 
 void akios_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
+/* once a process (a line about a refusal that would otherwise repeat every frame) */
+#define AK_ONCE(...) do { static int ak_said_; if (!ak_said_) { ak_said_ = 1; akios_say(__VA_ARGS__); } } while (0)
+/* a word in the boot-args (read once a process) */
+BOOL akios_boot_arg(const char *word);
+/* a refused draw, dispatch or copy fails its command buffer (boot-arg metal_strict, or AKIOS_METAL_STRICT=1 in the
+ * environment); otherwise it is left out and the rest runs, as Apple's driver runs a frame whatever is wrong in it */
+BOOL akios_strict(void);
+/* (AkiosMetalRender.m) the fragment constants a program was linked with, for the draw trace; whether it is on */
+void akm_note_constants(const void *program, NSString *constants);
+BOOL akm_tracing(void);
+/* (AkiosMetalPipelines.m) -[_MTLFunction newArgumentEncoderWithBufferIndex:] answered from the function's AIR for this
+ * device's functions (Metal's own needs its compiler's reflection, which this device has not got) */
+void akm_functions_encode_from_metadata(void);
+/* the number a texture, sampler or pipeline is told apart by while it lives: a counter from 1, never an address */
+uint64_t akios_next_id(void);
+/* a function's specialisation (MTLFunctionConstantValues) as the core takes it: at most MAX into OUT, the count */
+unsigned akios_function_constants(id function, hakios_metal_constant *out, unsigned max);
 
 @interface AkiosMaliDevice : IOGPUMetalDevice
 - (hakios_metal_device *)akCore;
@@ -112,6 +162,8 @@ void akios_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 @interface AkiosMaliTexture : IOGPUMetalTexture
 - (hakios_metal_texture *)akCore;
 - (BOOL)akWrap:(hakios_metal_device *)core layout:(const struct hakios_metal_texture_layout *)layout;
+- (void)akSetCore:(hakios_metal_texture *)core;
+- (void)akSetUsage:(MTLTextureUsage)usage;
 @end
 
 @interface AkiosMaliCommandBuffer : IOGPUMetalCommandBuffer
@@ -142,4 +194,47 @@ void akios_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 /* the device's pipelines, samplers (AkiosMetalState.m) */
 @interface AkiosMaliDevice (States)
 - (id)akComputePipelineForFunction:(id)function descriptor:(id)descriptor error:(NSError **)error;
+@end
+
+/* depth/stencil and render pipeline states (AkiosMetalPipelines.m, AkiosMetalRender.m) */
+@interface AkiosMaliDepthStencilState : NSObject <MTLDepthStencilState> {
+	__weak id<MTLDevice> _device;
+	NSString *_label;
+	unsigned _compare;
+	BOOL _write;
+	BOOL _stencil;
+	struct hakios_metal_stencil_face _front, _back;
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)device descriptor:(MTLDepthStencilDescriptor *)descriptor;
+- (unsigned)akDepthCompare;
+- (BOOL)akDepthWrite;
+- (BOOL)akStencil;
+- (const struct hakios_metal_stencil_face *)akStencilFront;
+- (const struct hakios_metal_stencil_face *)akStencilBack;
+@end
+
+@interface AkiosMaliRenderPipelineState : _MTLRenderPipelineState {
+	AkiosMaliDevice *_akDevice;
+	hakios_metal_program *_program;
+	uint64_t _akUniqueIdentifier;   /* the base's uniqueIdentifier is a nil-stub; see the sampler */
+	/* an uber shader's specialisations (akProgramFor:): its fragment bitcode and constants, the constant buffer
+	 * whose bytes choose its path, and the programs compiled for each content seen (NSNull while one compiles) */
+	NSData *_fsAir;
+	hakios_metal_constant _fsConstants[64];
+	unsigned _fsConstantCount;
+	int _specBinding;
+	unsigned _specLength;
+	NSMutableDictionary *_specialised;
+	char _standIn[256];                 /* not empty: a stand-in, no program -- why it could not be built (akm_stand_in) */
+}
+- (instancetype)initWithAkiosDevice:(AkiosMaliDevice *)device program:(hakios_metal_program *)program
+			  descriptor:(MTLRenderPipelineDescriptor *)descriptor;
+- (hakios_metal_program *)akProgram;
+- (void)akSetStandIn:(const char *)why;
+- (const char *)akStandIn;          /* NULL for a real pipeline */
+- (void)akSetProgram:(hakios_metal_program *)program;      /* a background compile's result: no longer a stand-in */
+- (hakios_metal_program *)akTakeProgram;                   /* its program, given up (the state then has none) */
+- (void)akKeepFragment:(NSData *)air constants:(const hakios_metal_constant *)constants count:(unsigned)count;
+- (hakios_metal_program *)akProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count;
+- (void)akAdoptSpecialisationOf:(AkiosMaliRenderPipelineState *)real;   /* a background compile's kept fragment */
 @end

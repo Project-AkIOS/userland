@@ -8,7 +8,7 @@
 #include <objc/message.h>
 
 /* the number a sampler is told apart by while it lives: a counter from 1, never an address (UIKit keys caches on it) */
-static uint64_t
+uint64_t
 akios_next_id(void)
 {
 	static uint64_t next;
@@ -174,7 +174,7 @@ akios_script_constants(const uint8_t *b, size_t size, hakios_metal_constant *out
 #undef FITS
 }
 
-static unsigned
+unsigned
 akios_function_constants(id function, hakios_metal_constant *out, unsigned max)
 {
 	SEL scriptSel = sel_getUid("specializationAirScript");
