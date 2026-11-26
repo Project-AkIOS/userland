@@ -410,6 +410,21 @@ main(int argc, char **argv)
 					return 7;
 				}
 			}
+			/* 8: the Mali's own selectors: a tiler heap (56) and its end (57) */
+			{
+				uint64_t hin[4] = { 2u << 20, 1, 64, 65535 }, hout[3] = { 0 };
+				uint32_t n = 3;
+				kr = IOConnectCallScalarMethod(c, 56, hin, 4, hout, &n);
+				printf("8: tiler heap: 0x%x, handle %llu, context 0x%llx, first chunk 0x%llx\n", kr, hout[0], hout[1], hout[2]);
+				if (kr != KERN_SUCCESS || hout[0] == 0) {
+					return 8;
+				}
+				kr = IOConnectCallScalarMethod(c, 57, hout, 1, NULL, NULL);
+				printf("8: tiler heap gone: 0x%x\n", kr);
+				if (kr != KERN_SUCCESS) {
+					return 8;
+				}
+			}
 			IOServiceClose(c);
 		}
 		IOObjectRelease(service);
