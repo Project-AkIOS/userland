@@ -207,24 +207,8 @@ entitlements = "src/MetalTest/MetalTest.entitlements"
 name = "ca-share"
 from = "@ca_share"
 
-# The firmware (the vendor's files, never in git; @firmware/fw-*): /fw of the image, where the kernel's drivers look
-# ("fw/NAME" of the RAM disk) and which the plan binds onto the system volume's /fw
-[firmware]
-files = [
-  "fw-gpu/mali_csffw-r54p2.bin",
-  "fw-wifi/fw_bcmdhd.bin_4383_a3", "fw-wifi/bcmdhd.cal_4383_a3", "fw-wifi/bcmdhd_clm.blob_4383_a3",
-  "fw-wifi/bcmdhd_txcap.blob_4383_a3", "fw-wifi/BCM.hcd",
-  "fw-haptic/cs40l26*.wmfw", "fw-haptic/cs40l26*.bin",
-  "fw-audio/cs35l41-dsp1-spk-*.wmfw", "fw-audio/cs35l41-dsp1-spk-*.bin", "fw-audio/R-cs35l41-dsp1-spk-*.bin",
-  "fw-aoc/aoc.bin",
-  "fw-camera-akita/camera-akita-*.isp",
-  "fw-modem-akita/nv_normal.bin", "fw-modem-akita/nv_protected.bin", "fw-modem-akita/replay_region.bin",
-  "fw-modem-akita/handover.bin",
-  "fw-gnss/kepler.bin", "fw-gnss/gnss-cfg.bin", "fw-gnss/gnss-start.bin",
-  "fw-sensors/usf-registry.bin",
-]
-# made at build time: the carriers' configuration packed into one file
-carrierconfig = "fw-modem-akita/carrierconfig"
+# The vendor's files (firmware) are the device's: [vendor_files] of devices/<name>/device.toml (ak userland puts
+# them at /fw of the image, where the kernel's drivers look)
 
 # The data volume's skeleton (/akita/etc/var.skel): the IPSW's template list, then these
 [var]
