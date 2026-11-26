@@ -40,7 +40,7 @@
 
 #include <IOSurface/IOSurfaceRef.h>
 
-#include "metal_kernels_lib.h"   /* (hakios-base userland/src: fill_id, tg_arg, pvt_fill, tex_fill, tex_copy, tex_sample_gid) */
+#include "metal_kernels_lib.h"   /* (metal/ca-plugin: fill_id, tg_arg, pvt_fill, tex_fill, tex_copy, tex_sample_gid) */
 #include "mali_draw_bc.h"        /* (... and tri_color_vs/fs's bitcode: hakios-metal tools/kernels/tri_color_*.ll) */
 
 /* A .metallib of a vertex and a fragment function from their bitcode: the container hakios-metal's
