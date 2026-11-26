@@ -88,19 +88,24 @@ frameworks = ["CoreFoundation"]
 plist = "src/audio/Info.plist"
 
 # Metal's plug-in built the AGXMetal way: subclasses of IOGPU.framework's IOGPUMetal* (phase 6; not the default yet)
+# (over the Mali core of the Metal tree: hakios_metal_open_iogpu and the external command buffers)
 [[build]]
 out = "akita/lib/AkiosMetal.bundle/AkiosMetal"
 kind = "bundle"
-src = ["src/metal/AkiosMetal.m"]
-flags = ["-fobjc-arc", "-F@sdk/System/Library/PrivateFrameworks", "-framework", "IOGPU"]
+src = ["src/metal/AkiosMetal.m", "src/metal/AkiosMetalTexture.m", "src/metal/AkiosMetalEncoders.m", "src/metal/AkiosMetalState.m",
+       "src/metal/AkiosMetalLimits.m"]
+flags = ["-fobjc-arc", "-F@sdk/System/Library/PrivateFrameworks", "-framework", "IOGPU", "-I@metal/include",
+         "@metal/out/ios-mali-arm64e/libhakios-metal.a"]
 frameworks = ["Foundation", "IOKit", "Metal"]
-libs = ["objc"]
+libs = ["objc", "c++", "z"]
 plist = "src/metal/Info.plist"
+make = ["make", "-C", "@metal", "ios-mali", "ARCH=arm64e", "HAKIOS=@legacy"]
 
+# (its step C kernels: the .metallib of the Metal tree's tools/kernels, metal_kernels_lib.h in the old userland)
 [[build]]
 out = "akita/bin/akios_metal_test"
 src = ["src/tools/akios_metal_test.m"]
-flags = ["-fobjc-arc"]
+flags = ["-fobjc-arc", "-I@metal_plugin"]
 frameworks = ["Foundation", "IOKit", "Metal"]
 libs = ["objc"]
 
