@@ -70,6 +70,54 @@ main(int argc, char **argv)
 		if (ev.signaledValue != 42) {
 			return 4;
 		}
+		/* B1: contents and GPU address */
+		id<MTLBuffer> b = [dev newBufferWithLength:100000 options:MTLResourceStorageModeShared];
+		uint8_t *bytes = b.contents;
+		int zero = 1;
+		for (int i = 0; bytes && i < 100000; i++) {
+			zero &= bytes[i] == 0;
+		}
+		if (bytes) {
+			memset(bytes, 0x77, 100000);
+		}
+		printf("B1: buffer %s, length %lu, contents %p (zeroed %d), gpuAddress 0x%llx, read back 0x%02x\n",
+		    b ? object_getClassName(b) : "nil", (unsigned long)b.length, bytes, zero, b.gpuAddress, bytes ? bytes[99999] : 0);
+		if (b == nil || bytes == NULL || !zero || b.gpuAddress == 0 || bytes[99999] != 0x77) {
+			return 5;
+		}
+		/* B2: many made and freed: the allocated size comes back */
+		uint64_t before = dev.currentAllocatedSize;
+		for (int i = 0; i < 10000; i++) {
+			@autoreleasepool {
+				id<MTLBuffer> t = [dev newBufferWithLength:4096 + (i % 7) * 4096 options:0];
+				if (t == nil) {
+					printf("B2: buffer %d not made\n", i);
+					return 6;
+				}
+			}
+		}
+		printf("B2: 10000 buffers made and freed; allocated size %llu before, %llu after\n", before, dev.currentAllocatedSize);
+		/* B3: no-copy, its deallocator */
+		__block int deallocated = 0;
+		void *mine = NULL;
+		posix_memalign(&mine, 16384, 32768);
+		@autoreleasepool {
+			id<MTLBuffer> n = [dev newBufferWithBytesNoCopy:mine length:32768 options:0
+			    deallocator:^(void *p, NSUInteger l) { deallocated = 1; free(p); }];
+			printf("B3: no-copy buffer %s, contents %s the pointer, gpuAddress 0x%llx\n", n ? "made" : "nil",
+			    n.contents == mine ? "is" : "is NOT", n.gpuAddress);
+			if (n == nil || n.contents != mine) {
+				return 7;
+			}
+		}
+		usleep(50000);
+		printf("B3: deallocator ran: %d\n", deallocated);
+		/* B4: private */
+		id<MTLBuffer> pv = [dev newBufferWithLength:65536 options:MTLResourceStorageModePrivate];
+		printf("B4: private buffer %s, gpuAddress 0x%llx\n", pv ? "made" : "nil", pv.gpuAddress);
+		if (pv == nil || pv.gpuAddress == 0) {
+			return 8;
+		}
 		printf("all steps passed\n");
 	}
 	return 0;

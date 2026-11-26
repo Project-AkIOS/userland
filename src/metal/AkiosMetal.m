@@ -17,6 +17,13 @@
 - (instancetype)initWithAcceleratorPort:(io_service_t)port;
 @end
 
+@interface IOGPUMetalBuffer : NSObject
+/* (types from the method's encoding on the phone: alignment and argsSize are 32-bit) */
+- (instancetype)initWithDevice:(id)device pointer:(void *)pointer length:(NSUInteger)length alignment:(uint32_t)alignment
+    options:(NSUInteger)options sysMemSize:(NSUInteger)sysMemSize gpuAddress:(uint64_t)gpuAddress args:(void *)args
+    argsSize:(uint32_t)argsSize deallocator:(void (^)(void *pointer, NSUInteger length))deallocator;
+@end
+
 @interface IOGPUMetalCommandQueue : NSObject
 - (instancetype)initWithDevice:(id)device descriptor:(MTLCommandQueueDescriptor *)descriptor;
 @end
@@ -32,6 +39,9 @@
 @end
 
 @interface AkiosMaliCommandQueue : IOGPUMetalCommandQueue
+@end
+
+@interface AkiosMaliBuffer : IOGPUMetalBuffer
 @end
 
 @interface AkiosMaliCommandBuffer : IOGPUMetalCommandBuffer
@@ -82,6 +92,50 @@ struct akios_cb_tail {
 	return [self newCommandQueueWithDescriptor:[MTLCommandQueueDescriptor new]];
 }
 
+/*
+ * Buffers: IOGPU's resources (selector 8), made by IOGPUMetalBuffer's initialiser with our (empty, for now) vendor tail
+ * after its 0x58-byte header; contents, gpuAddress, purgeability, residency and freeing are IOGPU's. Private storage
+ * keeps a processor mapping (0x20000, as AGX asks) while parts of the driver still write such memory themselves.
+ */
+#define AKIOS_RESOURCE_ARGS_SIZE        0x58
+
+- (id<MTLBuffer>)akiosBuffer:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
+    deallocator:(void (^)(void *, NSUInteger))deallocator
+{
+	uint8_t args[AKIOS_RESOURCE_ARGS_SIZE] = { 0 };
+	NSUInteger sysMemSize = pointer != NULL ? length : round_page(length);
+
+	if (length == 0) {
+		return nil;
+	}
+	if ((options & MTLResourceStorageModeMask) == MTLResourceStorageModePrivate) {
+		options |= 0x20000;
+	}
+	return (id<MTLBuffer>)[[AkiosMaliBuffer alloc] initWithDevice:self pointer:pointer length:length alignment:256
+	    options:options sysMemSize:sysMemSize gpuAddress:0 args:args argsSize:sizeof(args) deallocator:deallocator];
+}
+
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+{
+	return [self akiosBuffer:NULL length:length options:options deallocator:nil];
+}
+
+- (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options
+{
+	id<MTLBuffer> buffer = [self akiosBuffer:NULL length:length options:options deallocator:nil];
+
+	if (buffer != nil && buffer.contents != NULL) {
+		memcpy(buffer.contents, bytes, length);
+	}
+	return buffer;
+}
+
+- (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
+    deallocator:(void (^)(void *, NSUInteger))deallocator
+{
+	return [self akiosBuffer:pointer length:length options:options deallocator:deallocator];
+}
+
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count
 {
 	MTLCommandQueueDescriptor *descriptor = [MTLCommandQueueDescriptor new];
@@ -90,6 +144,9 @@ struct akios_cb_tail {
 	return [self newCommandQueueWithDescriptor:descriptor];
 }
 
+@end
+
+@implementation AkiosMaliBuffer
 @end
 
 @implementation AkiosMaliCommandQueue
