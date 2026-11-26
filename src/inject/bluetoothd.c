@@ -1,6 +1,13 @@
 /*
- * libakios.bluetoothd.dylib: code of ours inside BlueTool (build.sh's INJECT), for Bluetooth on a phone whose controller the
- * kernel has already switched on and loaded (devices/akita/drivers/bluetooth with bt=2; drivers/bluetooth's BT_HOST).
+ * libakios.bluetoothd.dylib: code of ours inside BlueTool (userland.toml's inject), for Bluetooth on a phone whose controller
+ * the kernel switches on and loads itself (xnu's bsd/dev/hakios.akita_bt.c with bt=2, hakios.bthost.c,
+ * iokit/Kernel/AppleBluetoothModule.cpp).
+ *
+ * STOPGAP (11-26): BlueTool cannot run here unmodified -- it picks its firmware and boot script from a table built into
+ * it by HW model and chip, and the table has no BCM4383 (BCM4350/4355 UART and BCM4377/4378/4387/4388 PCIe only); its
+ * override scripts are honoured only on Vendor and Internal installs. So it is answered for. The better stand-in, when
+ * there is time: a com.apple.BlueTool responder of its own that asks AppleBluetoothModule's user client for the
+ * controller's state instead of an injection into Apple's binary (research of 11-26, 4.3).
  *
  * iOS's bluetoothd asks BlueTool, over the service com.apple.BlueTool, to "boot" and "init" the controller: on an
  * iPhone BlueTool loads Broadcom's firmware for that iPhone's chip over a serial port and sets it up from the device
@@ -16,21 +23,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-
-/* (XNU's sys/kern_control.h and sys/sys_domain.h, which the SDK this is built with does not have) */
-#ifndef SYSPROTO_CONTROL
-#define SYSPROTO_CONTROL        2
-#endif
-#ifndef PF_SYSTEM
-#define PF_SYSTEM               AF_SYSTEM
-#endif
-struct ctl_info {
-	uint32_t ctl_id;
-	char ctl_name[96];
-};
-#define CTLIOCGINFO             _IOWR('N', 3, struct ctl_info)
 
 /* (libxpc's, declared here: the SDK this is built with has no xpc/xpc.h) */
 typedef void *xpc_object_t;
@@ -101,44 +93,7 @@ bluetool_serves(void)
 }
 
 /*
- * IN bluetoothd (build.sh's INJECT names it too, 11-16): wait for the controller's transport before bluetoothd runs.
- * The registry's "bluetooth" service and its address are published a second into the boot (so that SpringBoard's
- * BluetoothManager attaches and Control Center's button is not "unavailable"), but the controller and the kernel
- * control com.apple.uart.sk.bluetooth come only ~45 s later (devices/akita drivers/bluetooth). A bluetoothd started in
- * between -- launchd starts it for SpringBoard within seconds -- found the address, went on to open the transport and
- * died "Bluetooth fatal error, reason 1201" five times, and every bluetoothd after that aborted ~30 s after connecting.
- * Here its start simply waits (up to two minutes) until the kernel control exists; a client's message waits in its
- * queue meanwhile.
+ * (11-26) The wait inside bluetoothd that was here (wait_for_transport: up to two minutes until the kernel control
+ * com.apple.uart.sk.bluetooth existed) is gone: the kernel publishes the control as soon as BSD is up and holds an early
+ * connection until the controller answers (hakios.bthost.c, skel_wait_for_controller). bluetoothd runs as it is.
  */
-__attribute__((constructor))
-static void
-wait_for_transport(void)
-{
-	const char *name = getprogname();
-	char line[160];
-
-	if (name == NULL || strcmp(name, "bluetoothd") != 0) {
-		return;
-	}
-	for (int tries = 0; tries < 480; tries++) {
-		int fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
-		struct ctl_info info;
-
-		memset(&info, 0, sizeof(info));
-		strlcpy(info.ctl_name, "com.apple.uart.sk.bluetooth", sizeof(info.ctl_name));
-		if (fd >= 0 && ioctl(fd, CTLIOCGINFO, &info) == 0) {
-			close(fd);
-			if (tries != 0) {
-				snprintf(line, sizeof(line), "hakios: bluetoothd waited %d.%d s for the controller's transport\n", tries / 4,
-				    (tries % 4) * 25 / 10);
-				say(line);
-			}
-			return;
-		}
-		if (fd >= 0) {
-			close(fd);
-		}
-		usleep(250000);
-	}
-	say("hakios: bluetoothd: no controller transport after two minutes; started anyway\n");
-}

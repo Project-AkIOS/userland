@@ -71,11 +71,13 @@ src = ["src/inject/springboard.c"]
 libs = ["objc"]
 inject = ["SpringBoard"]
 
+# a stopgap: BlueTool has no BCM4383 in its table; this answers bluetoothd's boot and init for it (src/inject/bluetoothd.c).
+# (11-26: no longer in bluetoothd, which needs no wait now)
 [[build]]
 out = "akita/lib/libakios.bluetoothd.dylib"
 kind = "dylib"
 src = ["src/inject/bluetoothd.c"]
-inject = ["BlueTool", "bluetoothd"]
+inject = ["BlueTool"]
 
 # os_log lines on the console: in the programs named here, and with log_all=1 in every program ([boot] log_all_skip)
 [[build]]
