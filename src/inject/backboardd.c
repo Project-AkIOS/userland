@@ -1588,6 +1588,46 @@ publish_lock_button(bool down)
 	notify_set_state(token, down ? 2 : 1);
 }
 
+/* (the SDK marks it unavailable on iOS; IOKit.framework has it all the same) */
+extern kern_return_t akios_IORegistryEntrySetCFProperties(io_registry_entry_t, CFTypeRef)
+    __asm__("_IORegistryEntrySetCFProperties");
+
+/* boot-arg hid_buttons=1: the buttons are the kernel's IOHIDEventService (AkitaButtons), not a service made here */
+static bool kernel_buttons;
+
+/* a press of the lock button (Consumer 0x30, down then up) through the kernel's buttons service: its AkitaPressButton */
+static void
+kernel_press_lock(void)
+{
+	io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AkitaButtons"));
+
+	if (service == 0) {
+		say("hakios: input: no AkitaButtons service to wake the display with\n");
+		return;
+	}
+	for (int down = 1; down >= 0; down--) {
+		int page = 0x0c, usage = 0x30;
+		CFNumberRef p = CFNumberCreate(NULL, kCFNumberIntType, &page), u = CFNumberCreate(NULL, kCFNumberIntType, &usage);
+		const void *keys[] = { CFSTR("UsagePage"), CFSTR("Usage"), CFSTR("Down") };
+		const void *values[] = { p, u, down ? kCFBooleanTrue : kCFBooleanFalse };
+		CFDictionaryRef press = CFDictionaryCreate(NULL, keys, values, 3, &kCFTypeDictionaryKeyCallBacks,
+		    &kCFTypeDictionaryValueCallBacks);
+		const void *k2[] = { CFSTR("AkitaPressButton") }, *v2[] = { press };
+		CFDictionaryRef props = CFDictionaryCreate(NULL, k2, v2, 1, &kCFTypeDictionaryKeyCallBacks,
+		    &kCFTypeDictionaryValueCallBacks);
+		kern_return_t kr = akios_IORegistryEntrySetCFProperties(service, props);
+
+		if (kr != KERN_SUCCESS) {
+			say("hakios: input: AkitaPressButton: 0x%x\n", kr);
+		}
+		CFRelease(props);
+		CFRelease(press);
+		CFRelease(p);
+		CFRelease(u);
+	}
+	IOObjectRelease(service);
+}
+
 static void
 send_button(IOHIDServiceClientRef buttons, const struct hakios_touch *t)
 {
@@ -1639,6 +1679,7 @@ input_thread(__unused void *arg)
 
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 			touch_latency = strstr(arguments, "touch_lat=1") != NULL;
+			kernel_buttons = strstr(arguments, "hid_buttons=1") != NULL;
 		}
 		mach_timebase_info(&timebase);
 	}
@@ -1661,8 +1702,10 @@ input_thread(__unused void *arg)
 			say("hakios: input: a HID client of type %d may not create services\n", types[i]);
 		}
 	}
-	if (screen != NULL) {
+	if (screen != NULL && !kernel_buttons) {
 		/*
+		 * (Not with boot-arg hid_buttons=1: the kernel's own buttons service, AkitaButtons, is the built-in 0x0b/0x01
+		 * one then, and backboardd's event system reads it as an iPhone's.)
 		 * The buttons as an iPhone's built-in button service shows itself: primary usage Telephony / Phone, with
 		 * Consumer Control as its second pair (the lock and volume keys' events are of that page). ButtonResolver's
 		 * legacy interface (backboardd) takes the first built-in service of 0x0b/0x01 (or 0xff00/0x0b) and is not ready
@@ -1691,6 +1734,10 @@ input_thread(__unused void *arg)
 			if (buttons != NULL) {
 				send_button(buttons, &t);
 			}
+		} else if (t.type == HAKIOS_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && kernel_buttons) {
+			/* the display is off and a tap is to wake it: the lock button, pressed by the kernel's buttons service */
+			kernel_press_lock();
+			waking |= 1u << (t.finger & 31);
 		} else if (t.type == HAKIOS_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL) {
 			/*
 			 * The display is off and a tap is to wake it. The lock button is what wakes it here:
