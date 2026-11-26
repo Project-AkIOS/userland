@@ -1395,3 +1395,94 @@ akm_compile_queue(void)
 
 
 @end
+
+/* ============================================================================================================
+ * CoreAnimation's library stand-ins (the earlier plug-in's hm_library_stand_ins)
+ * ============================================================================================================ */
+
+/*
+ * Functions CoreAnimation asks its library for that the library it is given (ca_metallib=, QuartzCore-default.metallib)
+ * has not got under that name, or has in a form this CoreAnimation does not bind: each answered with the nearest
+ * function it has. luma_boost (a picture's luminance raised) by inplace_copy, the picture as it is; edr_scale (always:
+ * the library's reads buffers 5 and 7 and texture 9, which CoreAnimation binds for neither) by inplace_copy too. A
+ * function the library has, and is not marked "always", is never touched; libraries of other devices are left alone.
+ */
+static const char *const akm_stand_ins[][3] = {
+	/* asked for, given instead, "always" when the library's own is the wrong one (not just missing) */
+	{ "luma_boost_lph", "inplace_copy_lph", "" },
+	{ "luma_boost_lpf", "inplace_copy_lpf", "" },
+	{ "edr_scale_lph", "inplace_copy_lph", "always" },
+	{ "edr_scale_lpf", "inplace_copy_lpf", "always" },
+};
+
+/* (both selectors are of Metal's new family: their objects come back +1, handled as raw pointers so that ARC neither
+ * retains nor autoreleases them) */
+static void *(*akm_orig_fn_name)(id, SEL, NSString *);
+static void *(*akm_orig_fn_constants)(id, SEL, NSString *, MTLFunctionConstantValues *, NSError *__autoreleasing *);
+
+static NSString *
+akm_stand_in(id library, NSString *name, BOOL found)
+{
+	if (name == nil || ![library respondsToSelector:@selector(device)] || ![[library device] isKindOfClass:[AkiosMaliDevice class]]) {
+		return nil;
+	}
+	for (size_t i = 0; i < sizeof(akm_stand_ins) / sizeof(akm_stand_ins[0]); i++) {
+		if (strcmp(name.UTF8String, akm_stand_ins[i][0]) == 0 && (!found || akm_stand_ins[i][2][0] != 0)) {
+			return @(akm_stand_ins[i][1]);
+		}
+	}
+	return nil;
+}
+
+static void *
+akm_fn_name(id self, SEL sel, NSString *name)
+{
+	void *f = akm_orig_fn_name(self, sel, name);
+	NSString *other = akm_stand_in(self, name, f != NULL);
+
+	if (other != nil) {
+		if (f != NULL) CFRelease(f);
+		f = akm_orig_fn_name(self, sel, other);
+		if (f != NULL) {
+			AK_ONCE("the library has no usable %s: %s stands in for it\n", name.UTF8String, other.UTF8String);
+		}
+	}
+	return f;
+}
+
+static void *
+akm_fn_constants(id self, SEL sel, NSString *name, MTLFunctionConstantValues *values, NSError *__autoreleasing *error)
+{
+	void *f = akm_orig_fn_constants(self, sel, name, values, error);
+	NSString *other = akm_stand_in(self, name, f != NULL);
+
+	if (other != nil) {
+		if (f != NULL) CFRelease(f);
+		f = akm_orig_fn_constants(self, sel, other, values, error);
+		if (f != NULL) {
+			if (error != NULL) *error = nil;
+			AK_ONCE("the library has no usable %s: %s stands in for it (with constants)\n", name.UTF8String, other.UTF8String);
+		}
+	}
+	return f;
+}
+
+void
+akm_library_stand_ins(void)
+{
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		Class library = NSClassFromString(@"_MTLLibrary");
+		Method a = library ? class_getInstanceMethod(library, @selector(newFunctionWithName:)) : NULL;
+		Method b = library ? class_getInstanceMethod(library, @selector(newFunctionWithName:constantValues:error:)) : NULL;
+
+		if (a != NULL) {
+			akm_orig_fn_name = (void *(*)(id, SEL, NSString *))method_setImplementation(a, (IMP)akm_fn_name);
+		}
+		if (b != NULL) {
+			akm_orig_fn_constants = (void *(*)(id, SEL, NSString *, MTLFunctionConstantValues *, NSError *__autoreleasing *))
+			    method_setImplementation(b, (IMP)akm_fn_constants);
+		}
+	});
+}

@@ -155,6 +155,7 @@ akios_memory_free(void *context, void *cookie)
 		    conn != 0 ? hakios_metal_error() : "no connection");
 	}
 	akm_functions_encode_from_metadata();
+	akm_library_stand_ins();
 	return self;
 }
 

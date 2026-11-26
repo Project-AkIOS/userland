@@ -145,6 +145,8 @@ BOOL akm_tracing(void);
 /* (AkiosMetalPipelines.m) -[_MTLFunction newArgumentEncoderWithBufferIndex:] answered from the function's AIR for this
  * device's functions (Metal's own needs its compiler's reflection, which this device has not got) */
 void akm_functions_encode_from_metadata(void);
+/* (AkiosMetalPipelines.m) CoreAnimation's functions the given library lacks or has unusable, answered by stand-ins */
+void akm_library_stand_ins(void);
 /* the number a texture, sampler or pipeline is told apart by while it lives: a counter from 1, never an address */
 uint64_t akios_next_id(void);
 /* a function's specialisation (MTLFunctionConstantValues) as the core takes it: at most MAX into OUT, the count */

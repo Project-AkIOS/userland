@@ -100,6 +100,14 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 - (NSUInteger)linearTextureArrayAlignmentBytes { return 64; }
 - (NSUInteger)linearTextureArrayAlignmentSlice { return 64; }
 
+/* (a texture over a buffer's rows, -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: the same 64 bytes;
+ * IconRendering asks it beside the linear alignment, and the selector unanswered aborted iconservicesagent) */
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	(void)format;
+	return 64;
+}
+
 /* _MTLDevice's own answer is a NULL its caller dereferences: a real struct, named after the GPU (Metal then looks for a
  * pipelines.Mali-G715 library, finds none, and carries on) */
 - (const struct MTLTargetDeviceArch *)targetDeviceInfo
