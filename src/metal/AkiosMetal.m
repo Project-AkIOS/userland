@@ -51,6 +51,21 @@ akios_boot_arg(const char *word)
 	return strstr(args, word) != NULL;
 }
 
+/*
+ * A protocol declared by CLS (when this process has it and CLS does not already conform): the public Metal protocols
+ * are defined only in the GPU vendor's bundle on this phone, so IOGPU's classes do not conform to them at run time, and
+ * clients test it -- MPS's MPSCommandBufferImageCache refuses a command buffer that is not an MTLCommandBuffer, and
+ * SpringBoard then read a field of the nil it got (11-26, CA::Display's link callback). The earlier plug-in declared
+ * the same set (HakiosMetalCA.m: hm_adopt).
+ */
+void
+akios_adopt(Class cls, Protocol *protocol)
+{
+	if (protocol != NULL && !class_conformsToProtocol(cls, protocol)) {
+		class_addProtocol(cls, protocol);
+	}
+}
+
 BOOL
 akios_strict(void)
 {
@@ -111,11 +126,8 @@ akios_memory_free(void *context, void *cookie)
 + (void)load
 {
 	/* IOGPUMetalDevice asserts that its device conforms to MTLDeviceSPI (a vendor's class declares it) */
-	Protocol *spi = objc_getProtocol("MTLDeviceSPI");
-
-	if (spi != NULL) {
-		class_addProtocol(self, spi);
-	}
+	akios_adopt(self, objc_getProtocol("MTLDeviceSPI"));
+	akios_adopt(self, @protocol(MTLDevice));
 }
 
 /*
@@ -239,6 +251,12 @@ akios_memory_free(void *context, void *cookie)
 	hakios_metal_buffer *_akCore;   /* the core's wrapper over this memory (no memory of its own) */
 }
 
++ (void)load
+{
+	akios_adopt(self, @protocol(MTLBuffer));
+	akios_adopt(self, objc_getProtocol("MTLResourceSPI"));
+}
+
 - (void)akWrap:(hakios_metal_device *)core
 {
 	_akCore = hakios_metal_buffer_wrap(core, [self gpuAddress], [self contents], [self length],
@@ -261,6 +279,11 @@ akios_memory_free(void *context, void *cookie)
 /* ---- queues ---- */
 
 @implementation AkiosMaliCommandQueue
+
++ (void)load
+{
+	akios_adopt(self, @protocol(MTLCommandQueue));
+}
 
 /* neither IOGPU nor Metal makes the command buffers: the vendor's queue does (AGX: initWithQueue:retainedReferences:) */
 - (id<MTLCommandBuffer>)commandBuffer
@@ -287,6 +310,11 @@ akios_memory_free(void *context, void *cookie)
 	struct akios_cb_tail _tail;     /* the stream -commit built (0: no GPU work) */
 	hakios_metal_cb *_akCore;       /* what the encoders recorded (NULL: the device has no core) */
 	NSMutableArray *_akHeld;        /* what the encoders bound, alive until completion (retained or not: see -akHold:) */
+}
+
++ (void)load
+{
+	akios_adopt(self, @protocol(MTLCommandBuffer));
 }
 
 - (instancetype)initWithQueue:(id)queue retainedReferences:(BOOL)retained

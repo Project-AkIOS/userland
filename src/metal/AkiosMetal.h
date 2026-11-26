@@ -134,6 +134,8 @@ void akios_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 #define AK_ONCE(...) do { static int ak_said_; if (!ak_said_) { ak_said_ = 1; akios_say(__VA_ARGS__); } } while (0)
 /* a word in the boot-args (read once a process) */
 BOOL akios_boot_arg(const char *word);
+/* PROTOCOL declared by CLS at run time (the public Metal protocols are the GPU bundle's on this phone: see AkiosMetal.m) */
+void akios_adopt(Class cls, Protocol *protocol);
 /* a refused draw, dispatch or copy fails its command buffer (boot-arg metal_strict, or AKIOS_METAL_STRICT=1 in the
  * environment); otherwise it is left out and the rest runs, as Apple's driver runs a frame whatever is wrong in it */
 BOOL akios_strict(void);

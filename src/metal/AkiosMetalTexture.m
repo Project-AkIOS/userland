@@ -36,11 +36,10 @@ akios_layered(unsigned type)
 /* -[MTLRenderPassColorAttachmentDescriptorInternal setTexture:] asserts conformance to MTLTextureImplementation */
 + (void)load
 {
-	Protocol *impl = objc_getProtocol("MTLTextureImplementation");
-
-	if (impl != NULL && !class_conformsToProtocol(self, impl)) {
-		class_addProtocol(self, impl);
-	}
+	akios_adopt(self, @protocol(MTLTexture));
+	akios_adopt(self, objc_getProtocol("MTLTextureSPI"));
+	akios_adopt(self, objc_getProtocol("MTLTextureImplementation"));
+	akios_adopt(self, objc_getProtocol("MTLResourceSPI"));
 }
 
 - (void)akSetCore:(hakios_metal_texture *)core
