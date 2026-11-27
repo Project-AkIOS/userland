@@ -167,6 +167,10 @@ flags = ["-fobjc-arc"]
 frameworks = ["Foundation", "IOKit", "IOSurface"]
 
 [[build]]
+out = "akita/bin/clock_test"
+src = ["src/tools/clock_test.c"]
+
+[[build]]
 out = "akita/bin/metal_probe"
 src = ["src/tools/metal_probe.m"]
 flags = ["-fobjc-arc"]
