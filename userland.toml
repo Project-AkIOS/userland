@@ -167,6 +167,11 @@ flags = ["-fobjc-arc"]
 frameworks = ["Foundation", "IOKit", "IOSurface"]
 
 [[build]]
+out = "akita/bin/fb_test"
+src = ["src/tools/fb_test.c"]
+frameworks = ["CoreFoundation", "IOKit"]
+
+[[build]]
 out = "akita/bin/clock_test"
 src = ["src/tools/clock_test.c"]
 
