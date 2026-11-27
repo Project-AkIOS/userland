@@ -244,6 +244,132 @@ akios_layered(unsigned type)
 
 @end
 
+
+/*
+ * A texture layout (-newTextureLayoutWithDescriptor:isHeapOrBufferBacked:, 11-27): how this device wants a texture's
+ * bytes in memory a client fills ahead of the texture. ImageIO's ASTCTwiddler asks for one to stage an asset catalogue's
+ * ASTC image (icons) and reads its -size and -alignment; without the method SpringBoard died of an unrecognized selector
+ * at its first icon and launchd rebooted the phone. The order is the plainest: the levels one after another, each in
+ * rows of whole blocks (or pixels) packed tight, which -newTextureWithBytesNoCopy:... reads back the same way.
+ * (As the earlier plug-in had it, HakiosMetalTextureLayout.)
+ */
+static void
+akios_tight_level(NSUInteger width, NSUInteger height, NSUInteger levels, unsigned bw, unsigned bh, unsigned bytes,
+    NSUInteger level, NSUInteger *offset, NSUInteger *rowBytes, NSUInteger *rows)
+{
+	NSUInteger at = 0;
+
+	for (NSUInteger l = 0; l < levels; l++) {
+		const NSUInteger w = MAX(width >> l, (NSUInteger)1), h = MAX(height >> l, (NSUInteger)1);
+		const NSUInteger row = (w + bw - 1) / bw * bytes, down = (h + bh - 1) / bh;
+
+		if (l == level) {
+			*offset = at;
+			*rowBytes = row;
+			*rows = down;
+			return;
+		}
+		at += row * down;
+	}
+	*offset = at;   /* (LEVEL past the last: the whole size) */
+	*rowBytes = 0;
+	*rows = 0;
+}
+
+@interface AkiosTextureLayout : NSObject {
+	unsigned _blockW, _blockH, _bytes;
+	NSUInteger _width, _height, _levels;
+}
+- (instancetype)initWithDescriptor:(MTLTextureDescriptor *)descriptor blockW:(unsigned)bw blockH:(unsigned)bh bytes:(unsigned)bytes;
+@end
+
+struct akios_watermark { uint64_t a, b; };
+
+@implementation AkiosTextureLayout
+- (instancetype)initWithDescriptor:(MTLTextureDescriptor *)descriptor blockW:(unsigned)bw blockH:(unsigned)bh bytes:(unsigned)bytes
+{
+	self = [super init];
+	if (self != nil) {
+		_blockW = bw;
+		_blockH = bh;
+		_bytes = bytes;
+		_width = [descriptor width];
+		_height = [descriptor height];
+		_levels = MAX([descriptor mipmapLevelCount], (NSUInteger)1);
+	}
+	return self;
+}
+
+- (NSUInteger)size
+{
+	NSUInteger offset, row, rows;
+
+	akios_tight_level(_width, _height, _levels, _blockW, _blockH, _bytes, _levels, &offset, &row, &rows);
+	return offset;
+}
+
+- (NSUInteger)alignment { return 64; }
+- (void)initializeTextureMemory:(void *)memory { (void)memory; }
+- (void)finalizeTextureMemory:(void *)memory { (void)memory; }
+
+/* this layout's name for staged bytes (16 bytes, which ImageIO keeps and compares) */
+- (struct akios_watermark)watermark
+{
+	struct akios_watermark w;
+
+	memcpy(&w, "akios-tight-v1\0\0", 16);
+	return w;
+}
+
+- (BOOL)akRegion:(MTLRegion)r slice:(NSUInteger)slice level:(NSUInteger)level at:(NSUInteger *)at rowBytes:(NSUInteger *)rowBytes
+	    rows:(NSUInteger *)rows pitch:(NSUInteger *)pitch
+{
+	NSUInteger offset, row, down;
+
+	if (slice != 0 || level >= _levels || r.origin.z != 0 || r.size.depth != 1 || r.origin.x % _blockW != 0 ||
+	    r.origin.y % _blockH != 0) {
+		akios_say("refused: a texture layout's copy of %lux%lu at (%lu, %lu) of level %lu, slice %lu: one slice, depth 1, "
+		    "whole blocks\n", (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)r.origin.x,
+		    (unsigned long)r.origin.y, (unsigned long)level, (unsigned long)slice);
+		return NO;
+	}
+	akios_tight_level(_width, _height, _levels, _blockW, _blockH, _bytes, level, &offset, &row, &down);
+	*at = offset + r.origin.y / _blockH * row + r.origin.x / _blockW * _bytes;
+	*rowBytes = (r.size.width + _blockW - 1) / _blockW * _bytes;
+	*rows = (r.size.height + _blockH - 1) / _blockH;
+	*pitch = row;
+	return YES;
+}
+
+- (void)copyFromLinearBytes:(const void *)linear linearOffset:(NSUInteger)linearOffset linearBytesPerRow:(NSUInteger)linearBytesPerRow
+    linearBytesPerImage:(NSUInteger)linearBytesPerImage toTextureMemory:(void *)memory textureSlice:(NSUInteger)slice
+    textureLevel:(NSUInteger)level textureRegion:(MTLRegion)region
+{
+	NSUInteger at, rowBytes, rows, pitch;
+
+	(void)linearBytesPerImage;
+	if ([self akRegion:region slice:slice level:level at:&at rowBytes:&rowBytes rows:&rows pitch:&pitch]) {
+		for (NSUInteger r = 0; r < rows; r++) {
+			memcpy((uint8_t *)memory + at + r * pitch, (const uint8_t *)linear + linearOffset + r * linearBytesPerRow, rowBytes);
+		}
+	}
+}
+
+- (void)copyFromTextureMemory:(const void *)memory textureSlice:(NSUInteger)slice textureLevel:(NSUInteger)level
+    textureRegion:(MTLRegion)region toLinearBytes:(void *)linear linearOffset:(NSUInteger)linearOffset
+    linearBytesPerRow:(NSUInteger)linearBytesPerRow linearBytesPerImage:(NSUInteger)linearBytesPerImage
+{
+	NSUInteger at, rowBytes, rows, pitch;
+
+	(void)linearBytesPerImage;
+	if ([self akRegion:region slice:slice level:level at:&at rowBytes:&rowBytes rows:&rows pitch:&pitch]) {
+		for (NSUInteger r = 0; r < rows; r++) {
+			memcpy((uint8_t *)linear + linearOffset + r * linearBytesPerRow, (const uint8_t *)memory + at + r * pitch, rowBytes);
+		}
+	}
+}
+@end
+
 @implementation AkiosMaliDevice (Textures)
 
 /*
@@ -346,6 +472,72 @@ akm_surface_shape(IOSurfaceRef surface, NSUInteger plane, OSType fourcc, unsigne
 	    "usage %#lx, storage %lu\n", IOSurfaceGetID(surface), (unsigned long)plane, cc, IOSurfaceGetWidth(surface),
 	    IOSurfaceGetHeight(surface), rows, asked, as, (unsigned long)width, (unsigned long)height, (unsigned long)usage,
 	    (unsigned long)storage);
+}
+
+- (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)descriptor isHeapOrBufferBacked:(BOOL)backed
+{
+	unsigned bw, bh, bytes;
+
+	(void)backed;
+	if (descriptor == nil || !hakios_metal_format_block((unsigned)[descriptor pixelFormat], &bw, &bh, &bytes) ||
+	    ([descriptor textureType] != MTLTextureType2D && [descriptor textureType] != MTLTextureType1D) ||
+	    [descriptor arrayLength] != 1 || [descriptor depth] != 1) {
+		akios_say("refused: a texture layout for pixel format %lu, type %lu: a 1D or 2D texture of a format this device "
+		    "serves\n", (unsigned long)[descriptor pixelFormat], (unsigned long)[descriptor textureType]);
+		return nil;
+	}
+	return [[AkiosTextureLayout alloc] initWithDescriptor:descriptor blockW:bw blockH:bh bytes:bytes];
+}
+
+/*
+ * A texture over the caller's bytes (11-27): copied into a texture of the GPU's own. Compressed or mipmapped: the bytes
+ * are in -newTextureLayoutWithDescriptor:'s tight layout (ImageIO staged them so); else rows LENGTH / height bytes apart.
+ * The bytes are copied, so the deallocator gets them back at once.
+ */
+- (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)descriptor
+    deallocator:(void (^)(void *, NSUInteger))deallocator
+{
+	id<MTLTexture> texture = [self newTextureWithDescriptor:descriptor];
+	const NSUInteger width = [descriptor width], height = [descriptor height];
+	const NSUInteger levels = MAX([descriptor mipmapLevelCount], (NSUInteger)1);
+	unsigned bw = 1, bh = 1, per = 0;
+
+	if (texture == nil) {
+		return nil;
+	}
+	if (bytes == NULL || !hakios_metal_format_block((unsigned)[descriptor pixelFormat], &bw, &bh, &per)) {
+		akios_say("refused: a no-copy texture of pixel format %lu over %lu bytes\n", (unsigned long)[descriptor pixelFormat],
+		    (unsigned long)length);
+		return nil;
+	}
+	if (bw > 1 || bh > 1 || levels > 1) {
+		NSUInteger offset, row, rows;
+
+		akios_tight_level(width, height, levels, bw, bh, per, levels, &offset, &row, &rows);
+		if (length < offset) {
+			akios_say("refused: a no-copy texture of %lux%lu, %lu levels over %lu bytes: its layout takes %lu\n",
+			    (unsigned long)width, (unsigned long)height, (unsigned long)levels, (unsigned long)length, (unsigned long)offset);
+			return nil;
+		}
+		for (NSUInteger l = 0; l < levels; l++) {
+			akios_tight_level(width, height, levels, bw, bh, per, l, &offset, &row, &rows);
+			[texture replaceRegion:MTLRegionMake2D(0, 0, MAX(width >> l, (NSUInteger)1), MAX(height >> l, (NSUInteger)1))
+			    mipmapLevel:l withBytes:(const uint8_t *)bytes + offset bytesPerRow:row];
+		}
+	} else {
+		const NSUInteger pitch = height != 0 ? length / height : 0;
+
+		if (pitch < width * per) {
+			akios_say("refused: a no-copy texture of %lux%lu over %lu bytes: rows of %lu bytes do not hold the width\n",
+			    (unsigned long)width, (unsigned long)height, (unsigned long)length, (unsigned long)pitch);
+			return nil;
+		}
+		[texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:bytes bytesPerRow:pitch];
+	}
+	if (deallocator != nil) {
+		deallocator(bytes, length);
+	}
+	return texture;
 }
 
 /*
