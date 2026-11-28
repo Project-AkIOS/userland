@@ -7,6 +7,9 @@
  * of each (its place, its kind, its data container).
  */
 #import <Foundation/Foundation.h>
+#import <objc/message.h>
+#include <dlfcn.h>
+#import <objc/runtime.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -17,6 +20,7 @@
 - (BOOL)registerApplicationDictionary:(NSDictionary *)dictionary;
 - (BOOL)unregisterApplication:(NSURL *)url;
 - (BOOL)openApplicationWithBundleID:(NSString *)identifier;
+- (BOOL)installApplication:(NSURL *)url withOptions:(NSDictionary *)options error:(NSError **)error;
 @end
 @interface LSApplicationProxy : NSObject
 + (instancetype)applicationProxyForIdentifier:(NSString *)identifier;
@@ -67,6 +71,60 @@ main(int argc, char **argv)
 				    record != nil ? (record.dataContainerURL.path.UTF8String ?: "NONE") : "no record");
 			}
 			return 0;
+		}
+		/*
+		 * -i APP.app (11-28): installed the way a developer's app is (installd, "Developer" package -- Xcode's and
+		 * ideviceinstaller's way); iOS 27's LaunchServices refuses registerApplicationDictionary without a word.
+		 * installd takes a copy of the bundle into its own container.
+		 */
+		if (argc == 3 && strcmp(argv[1], "-i") == 0) {
+			NSError *error = nil;
+			BOOL ok = [workspace installApplication:[NSURL fileURLWithPath:@(argv[2])]
+						    withOptions:@{ @"PackageType": @"Developer" } error:&error];
+
+			printf("lsreg: %s: %s%s\n", argv[2], ok ? "installed" : "NOT installed: ",
+			    ok ? "" : error.description.UTF8String ?: "(no error)");
+			return !ok;
+		}
+		/*
+		 * -I APP.app [DOMAIN] (11-28): installd's own client (MobileInstallation's MIInstallerClient, as
+		 * MobileInstallationInstallApp uses it): -installURL:identity:targetingDomain:withOptions:returningResultInfo:
+		 * completion:. The domain's numbers are not public (default 2); the completion's arguments are printed as they come.
+		 */
+		if (argc >= 3 && strcmp(argv[1], "-I") == 0) {
+			NSString *path = @(argv[2]);
+			NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Info.plist"]];
+			unsigned long domain = argc >= 4 ? strtoul(argv[3], NULL, 0) : 2;
+			dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_NOW);
+			Class ic = NSClassFromString(@"MIInstallerClient"), idc = NSClassFromString(@"MIAppIdentity");
+			dispatch_semaphore_t done = dispatch_semaphore_create(0);
+			__block int result = 1;
+
+			if (ic == Nil || idc == Nil || info[@"CFBundleIdentifier"] == nil) {
+				printf("lsreg: -I: no MIInstallerClient/MIAppIdentity, or no identifier\n");
+				return 1;
+			}
+			id client = ((id (*)(Class, SEL, id))objc_msgSend)(ic, sel_registerName("installerWithProgressBlock:"),
+			    ^(id progress) { printf("lsreg: progress %s\n", [[progress description] UTF8String]); });
+			id identity = ((id (*)(id, SEL, id))objc_msgSend)([idc alloc], sel_registerName("initWithBundleID:"),
+			    info[@"CFBundleIdentifier"]);
+			/* (installd decodes an MIInstallOptions, not a dictionary: an NSDictionary there and it drops the connection) */
+			id options = ((id (*)(id, SEL, id))objc_msgSend)([NSClassFromString(@"MIInstallOptions") alloc],
+			    sel_registerName("initWithLegacyOptionsDictionary:"), @{ @"PackageType": @"Developer" });
+			((void (*)(id, SEL, BOOL))objc_msgSend)(options, sel_registerName("setDeveloperInstall:"), YES);
+			((void (*)(id, SEL, id))objc_msgSend)(options, sel_registerName("setBundleIdentifier:"), info[@"CFBundleIdentifier"]);
+			((void (*)(id, SEL, id, id, unsigned long, id, BOOL, id))objc_msgSend)(client,
+			    sel_registerName("installURL:identity:targetingDomain:withOptions:returningResultInfo:completion:"),
+			    [NSURL fileURLWithPath:path], identity, domain, options, YES,
+			    ^(unsigned long a, id b, id c, id d) {
+				printf("lsreg: completion: %#lx (%s) (%s) (%s)\n", a, [[b description] UTF8String] ?: "nil",
+				    [[c description] UTF8String] ?: "nil", [[d description] UTF8String] ?: "nil");
+				result = (a != 0 && ![b isKindOfClass:[NSError class]] && ![c isKindOfClass:[NSError class]] &&
+				    ![d isKindOfClass:[NSError class]]) ? 0 : 1;
+				dispatch_semaphore_signal(done);
+			});
+			dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC));
+			return result;
 		}
 		if (argc == 3 && strcmp(argv[1], "-o") == 0) {
 			BOOL ok = [workspace openApplicationWithBundleID:@(argv[2])];

@@ -4,14 +4,15 @@
 <dict>
 	<key>Label</key>
 	<string>com.akios.apps</string>
-	<!-- the applications the image carries told to LaunchServices at every start: the Metal test application
-	     (share/system-apps, kept on the owner's word). lsreg -w: 25 s in, a failed registration tried again.
-	     Registered already: said so, nothing done. -->
+	<!-- the Metal test application (share/system-apps, kept on the owner's word) installed by installd at every start
+	     (11-28: iOS 27's LaunchServices refuses registerApplicationDictionary; lsreg -I is installd's own client, which
+	     needs this job's domain, the mobile user's, to reach com.apple.mobile.installd). 30 s in. -->
 	<key>ProgramArguments</key>
 	<array>
 		<string>/akita/bin/lsreg</string>
 		<string>-w</string>
-		<string>25</string>
+		<string>30</string>
+		<string>-I</string>
 		<string>/private/preboot/akita/share/system-apps/MetalTest.app</string>
 	</array>
 	<key>RunAtLoad</key>

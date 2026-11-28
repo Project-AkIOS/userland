@@ -3,6 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>com.apple.lsapplicationworkspace.rebuildappdatabases</key><true/>
+	<key>com.apple.private.mobileinstall.allowedSPI</key><array><string>Install</string><string>Uninstall</string><string>Lookup</string><string>InstallForLaunchServices</string><string>InstallForInstallCoordination</string></array>
 	<key>com.apple.private.MobileContainerManager.allowed</key><true/>
 	<key>com.apple.private.coreservices.canmaplsdatabase</key><true/>
 	<key>com.apple.springboard.launchapplications</key><true/>
