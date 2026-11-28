@@ -17,6 +17,7 @@
 #include <IOSurface/IOSurfaceRef.h>
 #include <IOKit/IODataQueueClient.h>
 #include <mach/mach.h>
+#include <unistd.h>
 
 /* (the SDK marks the trap calls unavailable on iOS; IOGPU.framework calls them all the same) */
 extern kern_return_t akios_IOConnectTrap4(io_connect_t, uint32_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t)
@@ -36,6 +37,55 @@ dump(const char *what, const void *bytes, size_t size)
 		printf(" %02x", b[i]);
 	}
 	printf("\n");
+}
+
+/* (11-28) step 9's submission: the work buffer's stream once, both notifications waited for; 0 when they came */
+static int
+submit_stream(io_connect_t c, uint64_t queue, uint32_t shm_seg, uint32_t shm_kcmd, uint64_t gva, IODataQueueMemory *nq,
+    mach_port_t port, uint64_t token)
+{
+	uint8_t args[0x40] = { 0 };
+	uint32_t status = 0xffffffff;
+	kern_return_t kr;
+
+	*(uint32_t *)(args + 0x00) = shm_seg;
+	*(uint32_t *)(args + 0x04) = shm_kcmd;
+	*(uint64_t *)(args + 0x10) = 0x5c4ed100 + token;
+	*(uint64_t *)(args + 0x18) = 0xc0de0100 + token;
+	*(uint64_t *)(args + 0x30) = gva;
+	*(uint32_t *)(args + 0x38) = 24;
+	kr = IOConnectTrap4(c, 0, (uintptr_t)queue, 0x40, (uintptr_t)args, (uintptr_t)&status);
+	if (kr != KERN_SUCCESS) {
+		printf("9:   submit: 0x%x\n", kr);
+		return -1;
+	}
+	for (int got = 0; got < 2;) {
+		uint8_t entry[0x28];
+		uint32_t esize = sizeof(entry);
+
+		if (!IODataQueueDataAvailable(nq)) {
+			struct { mach_msg_header_t h; uint8_t pad[64]; } msg;
+			kern_return_t mr = mach_msg(&msg.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(msg), port, 2000, MACH_PORT_NULL);
+			if (mr != KERN_SUCCESS && !IODataQueueDataAvailable(nq)) {
+				printf("9:   no notification within 2 s\n");
+				return -1;
+			}
+			continue;
+		}
+		IODataQueueDequeue(nq, entry, &esize);
+		got++;
+	}
+	return 0;
+}
+
+static uint64_t
+purge(io_connect_t c, uint32_t id, uint64_t state, kern_return_t *kr)
+{
+	uint64_t in[2] = { id, state }, old = 0;
+	uint32_t n = 1;
+
+	*kr = IOConnectCallScalarMethod(c, 11, in, 2, &old, &n);
+	return old;
 }
 
 int
@@ -423,6 +473,97 @@ main(int argc, char **argv)
 				printf("8: tiler heap gone: 0x%x\n", kr);
 				if (kr != KERN_SUCCESS) {
 					return 8;
+				}
+			}
+			/*
+			 * 9 (11-28): purgeable memory for real, queue priority, app roles. The work buffer (kind 0): volatile, it
+			 * leaves the GPU once this client is idle; non-volatile, it comes back and the GPU's stream still runs;
+			 * emptied, the VM has taken its pages (the processor reads zeros) and the answer says "empty".
+			 */
+			{
+				uint32_t rid = *(uint32_t *)(rout + 0x24);
+				volatile uint32_t *word = (volatile uint32_t *)cpu + 0x1000 / 4;
+				uint64_t old;
+				int bad = 0;
+
+				old = purge(c, rid, 3, &kr);
+				printf("9: volatile: 0x%x, old state %llu (2 expected)\n", kr, old);
+				bad |= kr != KERN_SUCCESS || old != 2;
+				usleep(300 * 1000);
+				printf("9: the word while volatile (evicted, not purged): 0x%x (0xbeef expected)\n", *word);
+				bad |= *word != 0xbeef;
+				old = purge(c, rid, 1, &kr);
+				printf("9: keep (asks the state): 0x%x, state %llu (3 expected)\n", kr, old);
+				bad |= kr != KERN_SUCCESS || old != 3;
+				old = purge(c, rid, 2, &kr);
+				printf("9: non-volatile: 0x%x, old state %llu (3 expected)\n", kr, old);
+				bad |= kr != KERN_SUCCESS || old != 3;
+				cpu[0] = 1ULL << 56 | 92ULL << 48 | ((gva + 0x1000) & 0xffffffffffffULL);   /* (step 7 left 0xbeef's) */
+				cpu[1] = 2ULL << 56 | 94ULL << 48 | 0xcafe;
+				cpu[2] = 21ULL << 56 | 94ULL << 48 | 92ULL << 40 | 0x1ULL << 16;
+				*word = 0;
+				bad |= submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 1) != 0;
+				printf("9: the GPU's word after coming back: 0x%x (0xcafe expected)\n", *word);
+				bad |= *word != 0xcafe;
+
+				old = purge(c, rid, 4, &kr);
+				printf("9: empty: 0x%x, old state %llu (2 expected)\n", kr, old);
+				bad |= kr != KERN_SUCCESS || old != 2;
+				usleep(300 * 1000);
+				printf("9: the stream's first word after emptying: 0x%llx (0 expected: the pages went back)\n", cpu[0]);
+				bad |= cpu[0] != 0;
+				old = purge(c, rid, 2, &kr);
+				printf("9: non-volatile: 0x%x, old state %llu (4 expected: emptied)\n", kr, old);
+				bad |= kr != KERN_SUCCESS || old != 4;
+				cpu[0] = 1ULL << 56 | 92ULL << 48 | ((gva + 0x1000) & 0xffffffffffffULL);
+				cpu[1] = 2ULL << 56 | 94ULL << 48 | 0xcafe;
+				cpu[2] = 21ULL << 56 | 94ULL << 48 | 92ULL << 40 | 0x1ULL << 16;
+				*word = 0;
+				bad |= submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 2) != 0;
+				printf("9: the GPU's word after refilling: 0x%x (0xcafe expected)\n", *word);
+				bad |= *word != 0xcafe;
+				(void)purge(c, 99999, 3, &kr);
+				printf("9: an unknown resource: 0x%x (0xe00002c2 expected)\n", kr);
+				bad |= kr != (kern_return_t)0xe00002c2;
+
+				/* priority (26) and QoS (27), app roles (33/34) */
+				uint64_t qid = qout[0], prio = 0;
+				uint32_t pb[3] = { 0, 0, 0 }, n = 1, qos;   /* (12 bytes: the dispatch table's size) */
+				pb[0] = 0; pb[1] = 2;
+				kr = IOConnectCallMethod(c, 26, &qid, 1, pb, sizeof(pb), &prio, &n, NULL, NULL);
+				printf("9: priority high, background 2: 0x%x, taken %llu (0)\n", kr, prio);
+				bad |= kr != KERN_SUCCESS || prio != 0;
+				pb[0] = 5; n = 1;
+				kr = IOConnectCallMethod(c, 26, &qid, 1, pb, sizeof(pb), &prio, &n, NULL, NULL);
+				printf("9: priority real-time without the entitlement: 0x%x, taken %llu (0)\n", kr, prio);
+				bad |= kr != KERN_SUCCESS || prio != 0;
+				pb[0] = 3; n = 1;
+				kr = IOConnectCallMethod(c, 26, &qid, 1, pb, sizeof(pb), &prio, &n, NULL, NULL);
+				printf("9: priority 3: 0x%x (refused expected)\n", kr);
+				bad |= kr == KERN_SUCCESS;
+				pb[0] = 2; pb[1] = 2; n = 1;
+				kr = IOConnectCallMethod(c, 26, &qid, 1, pb, sizeof(pb), &prio, &n, NULL, NULL);
+				bad |= kr != KERN_SUCCESS;
+				*word = 0;
+				bad |= submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 3) != 0;
+				printf("9: low priority: 0x%x; the GPU's word 0x%x (0xcafe expected)\n", kr, *word);
+				bad |= *word != 0xcafe;
+				qos = 2;
+				kr = IOConnectCallMethod(c, 27, &qid, 1, &qos, sizeof(qos), NULL, NULL, NULL, NULL);
+				printf("9: QoS 2: 0x%x\n", kr);
+				bad |= kr != KERN_SUCCESS;
+				qos = 5;
+				kr = IOConnectCallMethod(c, 27, &qid, 1, &qos, sizeof(qos), NULL, NULL, NULL, NULL);
+				printf("9: QoS 5: 0x%x (refused expected)\n", kr);
+				bad |= kr == KERN_SUCCESS;
+				uint64_t rin[2] = { (uint64_t)getpid(), 7 }, role = 0;
+				kr = IOConnectCallScalarMethod(c, 33, rin, 2, NULL, NULL);
+				n = 1;
+				kern_return_t kr2 = IOConnectCallScalarMethod(c, 34, rin, 1, &role, &n);
+				printf("9: app role set 0x%x, read 0x%x: %llu (7 expected)\n", kr, kr2, role);
+				bad |= kr != KERN_SUCCESS || kr2 != KERN_SUCCESS || role != 7;
+				if (bad) {
+					return 9;
 				}
 			}
 			IOServiceClose(c);
