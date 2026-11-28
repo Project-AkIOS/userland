@@ -41,6 +41,12 @@ section data if flag:root-switched if bootarg:var_hfs
 chdir /private/var/staged_system_apps staged-reachable
 if !bootarg:var_template=0 seedvar /dev/$var_hfs /private/xarts
 must hfs /dev/$var_hfs /private/var
+# (11-28) the system's staged applications in sight again at their own path, read-only: /Applications' aliases name
+# /private/var/staged_system_apps/NAME.app, and with the data volume over /private/var that path led into the data
+# volume's own (empty) directory -- Clock, Wallet, Notes, Health, the App Store ... ended at launch ("Could not find
+# and/or execute program ... access(/private/var/staged_system_apps/MobileTimer, X_OK)"). "." is the system volume's
+# directory: the working directory the chdir above left there.
+bind . /private/var/staged_system_apps
 flag var-kept
 flag var-mounted
 empty /private/var/tmp
