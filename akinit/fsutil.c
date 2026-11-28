@@ -393,6 +393,26 @@ mount_hfs(const char *dev, const char *at)
 	} args;
 
 	memset(&args, 0, sizeof(args));
+	/*
+	 * (11-28) An APFS data volume (iOS 27's installd installs only onto APFS: "Expected install path ... APFS
+	 * formatted volume; got hfs"): the container's superblock says "NXSB" at byte 32 of the first block -- then
+	 * Apple's APFS mounts it, read-write; anything else is taken for HFS Plus as before.
+	 */
+	{
+		char block[64];
+		int fd = open(dev, O_RDONLY, 0);
+		ssize_t n = fd >= 0 ? read(fd, block, sizeof(block)) : -1;
+
+		if (fd >= 0) {
+			close(fd);
+		}
+		if (n == (ssize_t)sizeof(block) && memcmp(block + 32, "NXSB", 4) == 0) {
+			int r = mount("apfs", at, 0, (void *)dev) == 0 ? 0 : errno;
+
+			printf("  %s: an APFS container: mounted read-write on %s: %s\n", dev, at, r == 0 ? "ok" : strerror(r));
+			return r;
+		}
+	}
 	args.fspec = dev;
 	return mount("hfs", at, 0, &args) == 0 ? 0 : errno;
 }
