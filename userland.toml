@@ -165,6 +165,7 @@ out = "akita/bin/iogpu_test"
 src = ["src/tools/iogpu_test.m"]
 flags = ["-fobjc-arc"]
 frameworks = ["Foundation", "IOKit", "IOSurface"]
+entitlements = "src/tools/iogpu_test.entitlements"
 
 [[build]]
 out = "akita/bin/surf_test"

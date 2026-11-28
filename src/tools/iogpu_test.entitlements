@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- step 10: a helper copy of the test sets the test's GPU role (setpriority PRIO_DARWIN_GPU), as RunningBoard does -->
+	<key>com.apple.private.set-gpu-role</key>
+	<true/>
+</dict>
+</plist>

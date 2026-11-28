@@ -18,6 +18,11 @@
 #include <IOKit/IODataQueueClient.h>
 #include <mach/mach.h>
 #include <unistd.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <string.h>
+#include <stdlib.h>
 
 /* (the SDK marks the trap calls unavailable on iOS; IOGPU.framework calls them all the same) */
 extern kern_return_t akios_IOConnectTrap4(io_connect_t, uint32_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t)
@@ -40,6 +45,8 @@ dump(const char *what, const void *bytes, size_t size)
 }
 
 /* (11-28) step 9's submission: the work buffer's stream once, both notifications waited for; 0 when they came */
+static uint32_t last_status;     /* (the completion's status of the last submit_stream) */
+
 static int
 submit_stream(io_connect_t c, uint64_t queue, uint32_t shm_seg, uint32_t shm_kcmd, uint64_t gva, IODataQueueMemory *nq,
     mach_port_t port, uint64_t token)
@@ -73,9 +80,36 @@ submit_stream(io_connect_t c, uint64_t queue, uint32_t shm_seg, uint32_t shm_kcm
 			continue;
 		}
 		IODataQueueDequeue(nq, entry, &esize);
+		if (*(uint64_t *)entry == 0xc0de0100 + token) {
+			last_status = *(uint32_t *)(entry + 0x18);
+		}
 		got++;
 	}
 	return 0;
+}
+
+/* (11-28) the GPU role of PID set from another process (the kernel refuses a process its own), as RunningBoard does */
+static int
+set_gpu_role(pid_t pid, int role)
+{
+	char spid[16], srole[8], self[1024];
+	char *argv[] = { self, "--set-gpu-role", spid, srole, NULL };
+	uint32_t size = sizeof(self);
+	pid_t child;
+	int status = 0;
+	extern int _NSGetExecutablePath(char *, uint32_t *);
+	extern int posix_spawn(pid_t *, const char *, const void *, const void *, char *const[], char *const[]);
+	extern char **environ;
+
+	if (_NSGetExecutablePath(self, &size) != 0) {
+		return -1;
+	}
+	snprintf(spid, sizeof(spid), "%d", pid);
+	snprintf(srole, sizeof(srole), "%d", role);
+	if (posix_spawn(&child, self, NULL, NULL, argv, environ) != 0 || waitpid(child, &status, 0) != child) {
+		return -1;
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 static uint64_t
@@ -91,6 +125,47 @@ purge(io_connect_t c, uint32_t id, uint64_t state, kern_return_t *kr)
 int
 main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--dual") == 0) {
+		/*
+		 * (11-28) a copy flipping its queue's priority 600 times (the groups' mix non-default most of the time) while four
+		 * plain copies, one after another, make fresh queues whose groups must start into that mix
+		 */
+		extern int posix_spawn(pid_t *, const char *, const void *, const void *, char *const[], char *const[]);
+		extern int _NSGetExecutablePath(char *, uint32_t *);
+		extern char **environ;
+		char self[1024];
+		uint32_t size = sizeof(self);
+		char *sargv[] = { self, "--prio-stress", "600", NULL }, *pargv[] = { self, NULL };
+		pid_t stress, plain;
+		int st = 0, failed = 0;
+
+		if (_NSGetExecutablePath(self, &size) != 0 || posix_spawn(&stress, self, NULL, NULL, sargv, environ) != 0) {
+			return 1;
+		}
+		usleep(500 * 1000);
+		for (int i = 0; i < 4; i++) {
+			if (posix_spawn(&plain, self, NULL, NULL, pargv, environ) != 0 || waitpid(plain, &st, 0) != plain) {
+				return 1;
+			}
+			printf("dual: plain copy %d: exit %d\n", i, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+			failed |= !WIFEXITED(st) || WEXITSTATUS(st) != 0;
+		}
+		waitpid(stress, &st, 0);
+		printf("dual: the stressing copy: exit %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+		failed |= !WIFEXITED(st) || WEXITSTATUS(st) != 0;
+		printf("dual: %s\n", failed ? "FAILED" : "all passed");
+		return failed;
+	}
+	if (argc == 4 && strcmp(argv[1], "--set-gpu-role") == 0) {
+		/* (PRIO_DARWIN_GPU 5: who is a pid, the value a darwin GPU role -- 1 allow, 2 deny, ...) */
+		int r = setpriority(5, atoi(argv[2]), atoi(argv[3]));
+
+		if (r != 0) {
+			printf("10: setpriority(PRIO_DARWIN_GPU): %s\n", strerror(errno));
+		}
+		return r != 0;
+	}
+
 	@autoreleasepool {
 		io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOAcceleratorES"));
 		io_connect_t connect = 0;
@@ -564,6 +639,91 @@ main(int argc, char **argv)
 				bad |= kr != KERN_SUCCESS || kr2 != KERN_SUCCESS || role != 7;
 				if (bad) {
 					return 9;
+				}
+			}
+			/*
+			 * 10 (11-28): an evicted buffer used by a submission that does not name it (the stream itself lives in it):
+			 * the GPU finds the scratch page (zeros: no instructions) instead of a hole -- no fault, the buffer completes;
+			 * then live priority changes; then the background rule, the test's GPU role set as RunningBoard sets one.
+			 */
+			{
+				uint32_t rid = *(uint32_t *)(rout + 0x24);
+				volatile uint32_t *word = (volatile uint32_t *)cpu + 0x1000 / 4;
+				uint64_t qid = qout[0], prio = 0, old;
+				uint32_t pb[3] = { 0, 2, 0 }, n = 1;
+				int bad = 0;
+
+				old = purge(c, rid, 3, &kr);
+				usleep(300 * 1000);
+				last_status = 0xffffffff;
+				bad |= submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 10) != 0;
+				printf("10: an evicted buffer used unannounced: completed with status %u (0: no fault)\n", last_status);
+				bad |= last_status != 0;
+				old = purge(c, rid, 2, &kr);
+				printf("10: back: 0x%x, old state %llu (3 expected)\n", kr, old);
+				bad |= kr != KERN_SUCCESS || old != 3;
+				cpu[0] = 1ULL << 56 | 92ULL << 48 | ((gva + 0x1000) & 0xffffffffffffULL);
+				cpu[1] = 2ULL << 56 | 94ULL << 48 | 0xcafe;
+				cpu[2] = 21ULL << 56 | 94ULL << 48 | 92ULL << 40 | 0x1ULL << 16;
+				*word = 0;
+				bad |= submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 11) != 0;
+				printf("10: the GPU's word after that: 0x%x (0xcafe expected)\n", *word);
+				bad |= *word != 0xcafe;
+
+				/* live priority: high, then low, the group resident (it just ran) -- the kernel log says each change */
+				pb[0] = 0; pb[1] = 2; n = 1;
+				kr = IOConnectCallMethod(c, 26, &qid, 1, pb, sizeof(pb), &prio, &n, NULL, NULL);
+				*word = 0;
+				bad |= kr != KERN_SUCCESS || submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 12) != 0;
+				printf("10: high priority, resident: 0x%x; the GPU's word 0x%x (0xcafe)\n", kr, *word);
+				bad |= *word != 0xcafe;
+				pb[0] = 2; n = 1;
+				kr = IOConnectCallMethod(c, 26, &qid, 1, pb, sizeof(pb), &prio, &n, NULL, NULL);
+				*word = 0;
+				bad |= kr != KERN_SUCCESS || submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 13) != 0;
+				printf("10: low priority, resident: 0x%x; the GPU's word 0x%x (0xcafe)\n", kr, *word);
+				bad |= *word != 0xcafe;
+
+				/* PRIO_STRESS=N: N flips between high and low with work between, while the system draws (11-28: is a running
+				 * group's live priority change harmless to the others?) */
+				const char *stress = argc >= 3 && strcmp(argv[1], "--prio-stress") == 0 ? argv[2] : getenv("PRIO_STRESS");
+				for (int k = 0, nk = stress ? atoi(stress) : 0; k < nk; k++) {
+					pb[0] = (k & 1) ? 2 : 0; pb[1] = 2; n = 1;
+					(void)IOConnectCallMethod(c, 26, &qid, 1, pb, sizeof(pb), &prio, &n, NULL, NULL);
+					bad |= submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 100 + (k & 0xff)) != 0;
+				}
+				if (stress) {
+					printf("10: %d priority flips done\n", atoi(stress));
+				}
+				/* the background rule */
+				pb[0] = 1; pb[1] = 2; n = 1;
+				(void)IOConnectCallMethod(c, 26, &qid, 1, pb, sizeof(pb), &prio, &n, NULL, NULL);
+				int r = set_gpu_role(getpid(), 2);
+				printf("10: GPU role DENY set by a helper: %d (0 expected)\n", r);
+				bad |= r != 0;
+				*word = 0;
+				last_status = 0xffffffff;
+				bad |= submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 14) != 0;
+				printf("10: denied, background 2: status %u, the GPU's word 0x%x (runs at low priority: 0xcafe)\n", last_status,
+				    *word);
+				bad |= *word != 0xcafe;
+				pb[1] = 3; n = 1;
+				(void)IOConnectCallMethod(c, 26, &qid, 1, pb, sizeof(pb), &prio, &n, NULL, NULL);
+				*word = 0;
+				last_status = 0xffffffff;
+				bad |= submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 15) != 0;
+				printf("10: denied, background 3: status %u, the GPU's word 0x%x (refused: not 0, word 0)\n", last_status,
+				    *word);
+				bad |= last_status == 0 || *word != 0;
+				r = set_gpu_role(getpid(), 1);
+				pb[1] = 2; n = 1;
+				(void)IOConnectCallMethod(c, 26, &qid, 1, pb, sizeof(pb), &prio, &n, NULL, NULL);
+				*word = 0;
+				bad |= submit_stream(c, qout[0], shm[1].id, shm[0].id, gva, nq, port, 16) != 0;
+				printf("10: GPU role ALLOW again (%d): the GPU's word 0x%x (0xcafe)\n", r, *word);
+				bad |= r != 0 || *word != 0xcafe;
+				if (bad) {
+					return 10;
 				}
 			}
 			IOServiceClose(c);
